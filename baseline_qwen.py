@@ -1,41 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Baseline (Qwen-VL two-stage) for the Highlight Video Re-framing task.
-基线方案（Qwen-VL 两阶段）：视频高光重构图任务。
+Baseline (Qwen3.5-4B-awq-int4 two-stage) for the Highlight Video Re-framing task.
+基线方案（Qwen3.5-4B-awq-int4 两阶段）：视频高光重构图任务。
 
-This baseline reads ONLY the public test index (video_id + targetRatioWH) and
-the input videos. It does NOT use any ground-truth annotation.
-本基线仅读取公开的测试索引（video_id + 目标画幅）与输入视频，
-不依赖任何真值标注。
+本基线仅读取公开的测试索引（video_id + 目标画幅）与输入视频，不依赖任何真值标注。
 
 Two stages 两阶段:
-  Stage 1  Highlight localization (temporal grounding):
-           Feed the whole video to a video-LLM and let it predict the time
-           interval(s) [start_sec, end_sec] of the most highlight-worthy clip.
-           阶段1 高光定位：把整段视频喂给视频大模型，预测高光时间区间（秒）。
+  阶段1 高光定位：把整段视频喂给视频大模型，预测高光时间区间（秒）。
 
-  Stage 2  Per-frame re-framing:
-           Given the target aspect ratio and source size, the crop box SIZE is
-           uniquely determined (largest target-ratio rectangle inside the
-           frame). So the model only predicts the SUBJECT CENTER; the script
-           places the crop window and clamps it inside the frame, then
-           densifies every frame inside the segment by interpolation.
-           阶段2 逐帧重构图：目标比例+源尺寸已确定裁剪框尺寸，模型只需预测主体
-           中心点，脚本放置裁剪窗并夹紧到画面内，再按关键帧插值得到逐帧框。
+  阶段2 逐帧重构图：目标比例+源尺寸已确定裁剪框尺寸，模型只需预测主体
+        中心点，脚本放置裁剪窗并夹紧到画面内，再按关键帧插值得到逐帧框。
 
-Output (submission format, one JSON object per line per video):
 输出（提交格式，每行一个视频对象）:
     {"video_id": "0", "targetRatioWH": [16, 9],
      "predictions": [{"frame": 10, "bboxes": [x, y, w]}, ...]}
-  bboxes is a TRIPLET [x, y, w]; the height is derived by the evaluator as
-  h = w * target_h / target_w.
   bboxes 为三元组 [x, y, w]；高度由评测程序按 h = w * th/tw 自动补算。
 
-注：此代码采用的是本地windows环境运行代码+wsl子系统上使用vllm部署模型并暴露出OpenAPI兼容的http接口 来进行测试
-    为了尽量减少对baseline的修改，所以保留了原有的本地文件检测，但实际使用的数据文件在wsl系统中（未进行文件检测），与本地文件完全一致【代码行数定位：350、621】
+注：此代码采用的是本地windows环境运行代码+wsl子系统上使用vllm部署模型并暴露出OpenAPI兼容的http接口来进行测试
+    为了尽量减少对baseline的修改，所以保留了原有的本地文件检测，但实际使用的数据文件在wsl系统中（未进行文件检测），
+    与本地文件完全一致【代码行数定位：350、621】
 
-Dependencies: torch, transformers, qwen-vl-utils, opencv-python, pillow, numpy
+Dependencies: torch, transformers, qwen-vl-utils, opencv-python, pillow, numpy,openai,vllm
 """
 import base64
 import io
@@ -43,15 +29,11 @@ import os
 import re
 import json
 import argparse
-from typing import cast
 
 import cv2
 import time
 from PIL import Image
 from openai import OpenAI
-from openai.types.chat import ChatCompletionUserMessageParam
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 
 # --------------------------- IO: test index ---------------------------
@@ -279,55 +261,8 @@ class QwenVL:
         )
         self.client = client
         self.model = "QuantTrio/Qwen3.5-4B-AWQ"
-        # import torch  # noqa
-        # from transformers import AutoProcessor
-        # model = None
-        # try:
-        #     from transformers import AutoModelForImageTextToText
-        #     model = AutoModelForImageTextToText.from_pretrained(
-        #         model_path, torch_dtype=dtype, device_map=device_map)
-        # except Exception:
-        #     try:
-        #         from transformers import Qwen2_5_VLForConditionalGeneration as M
-        #         model = M.from_pretrained(model_path, torch_dtype=dtype,
-        #                                   device_map=device_map)
-        #     except Exception:
-        #         from transformers import AutoModelForVision2Seq as M
-        #         model = M.from_pretrained(model_path, torch_dtype=dtype,
-        #                                   device_map=device_map)
-        # model.eval()
-        # self.model = model
-        # proc_kwargs = {}
-        # if min_pixels:
-        #     proc_kwargs["min_pixels"] = min_pixels
-        # if max_pixels:
-        #     proc_kwargs["max_pixels"] = max_pixels
-        # self.processor = AutoProcessor.from_pretrained(model_path, **proc_kwargs)
 
     def _generate(self, messages, max_new_tokens=2560):
-        # tmpl_kwargs = dict(tokenize=False, add_generation_prompt=True)
-        # try:
-        #     text = self.processor.apply_chat_template(
-        #         messages, enable_thinking=self.enable_thinking, **tmpl_kwargs)
-        # except (TypeError, ValueError):
-        #     text = self.processor.apply_chat_template(messages, **tmpl_kwargs)
-        # try:
-        #     from qwen_vl_utils import process_vision_info
-        #     image_inputs, video_inputs = process_vision_info(messages)
-        # except Exception:
-        #     image_inputs, video_inputs = None, None
-        # inputs = self.processor(
-        #     text=[text], images=image_inputs, videos=video_inputs,
-        #     padding=True, return_tensors="pt")
-        # inputs = inputs.to(self.model.device)
-        # import torch
-        # with torch.no_grad():
-        #     gen = self.model.generate(**inputs, max_new_tokens=max_new_tokens,
-        #                               do_sample=False)
-        # trimmed = gen[:, inputs.input_ids.shape[1]:]
-        # return self.processor.batch_decode(
-        #     trimmed, skip_special_tokens=True,
-        #     clean_up_tokenization_spaces=False)[0]
         pass
 
 
@@ -339,15 +274,16 @@ class QwenVL:
             "Output ONLY JSON format text, do not use markdown,do not output ```json,no extra text or symbol strictly, example: "
             "{\"segments\": [[start_sec, end_sec]]}"
         )
-        # messages = [{
-        #     "role": "user",
-        #     "content": [
-        #         {"type": "video", "video": video_path, "fps": fps_sample},
-        #         {"type": "text", "text": prompt},
-        #     ],
-        # }]
-        # raw = self._generate(messages, max_new_tokens=max_new_tokens)
-        video_url = "file:////home/putik-ubuntu/datasets/video-clip/highlight-clip-source/video/" + os.path.basename(video_path) # 使用本地的文件，减少格式转换，加快数据传输
+        video_url = "file:////home/putik-ubuntu/datasets/video-clip/highlight-clip-source/video/" + os.path.basename(video_path)  # 使用本地的文件，减少格式转换，加快数据传输
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "video_url", "video_url": {"url": video_url}},
+                ],
+            }
+        ]
         hight_light_schema = {
             "type": "object",
             "properties": {
@@ -366,26 +302,8 @@ class QwenVL:
             ]
         }
         ## Use video url in the payload
-        user_message = cast(
-            ChatCompletionUserMessageParam,
-            cast(object, {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "video_url", "video_url": {"url": video_url}},
-                ],
-            })
-        )
         chat_completion_from_url = self.client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "video_url", "video_url": {"url": video_url}},
-                    ],
-                }
-            ],
+            messages=messages,
             model=self.model,
             max_completion_tokens=max_new_tokens,
             response_format={
@@ -418,13 +336,6 @@ class QwenVL:
             "Output ONLY JSON format text, do not use markdown,do not output ```json,no extra text or symbol strictly, example: {\"center\": [x, y]}"
             % (int(tw), int(th))
         )
-        # messages = [{
-        #     "role": "user",
-        #     "content": [
-        #         {"type": "image", "image": pil_img},
-        #         {"type": "text", "text": prompt},
-        #     ],
-        # }]
         def pil_to_data_url(pil):
             buffer = io.BytesIO()
 
@@ -440,6 +351,15 @@ class QwenVL:
 
             return f"data:image/jpeg;base64,{base64_image}"
         image_url = pil_to_data_url(pil_img)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ]
         focus_point_schema = {
             "type": "object",
             "properties": {
@@ -458,26 +378,8 @@ class QwenVL:
             ]
         }
         ## Use video url in the payload
-        user_message = cast(
-            ChatCompletionUserMessageParam,
-            cast(object, {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            })
-        )
         chat_completion_from_url = self.client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }
-            ],
+            messages=messages,
             model=self.model,
             max_completion_tokens=max_new_tokens,
             response_format={
@@ -495,9 +397,6 @@ class QwenVL:
 
         raw = {"content":chat_completion_from_url.choices[0].message.content,"reasoning":chat_completion_from_url.choices[0].message.reasoning}
         return raw # 未做健壮性检查
-        # return self._generate(messages, max_new_tokens=max_new_tokens)
-
-
 
 # --------------------------- Segment processing ---------------------------
 def crop_keyframes(model, video_path, seg, target, stride, W, H, cw, ch,
