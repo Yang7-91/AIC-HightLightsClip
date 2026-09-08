@@ -9,8 +9,9 @@ Baseline (Qwen3.5-4B-awq-int4 two-stage) for the Highlight Video Re-framing task
 Two stages 两阶段:
   阶段1 高光定位：把整段视频喂给视频大模型，预测高光时间区间（秒）。
 
-  阶段2 逐帧重构图：目标比例+源尺寸已确定裁剪框尺寸，模型只需预测主体
-        中心点，脚本放置裁剪窗并夹紧到画面内，再按关键帧插值得到逐帧框。
+  阶段2 逐帧重构图：Qwen在每个镜头选择重要主体并给出提示框，SAM 2
+        在镜头内传播逐帧掩码，再生成动态尺度、平滑且合法的构图框。
+        可用 --stage2-backend linear 回到原中心点+线性插值基线。
 
 输出（提交格式，每行一个视频对象）:
     {"video_id": "0", "targetRatioWH": [16, 9],
@@ -29,11 +30,20 @@ import os
 import re
 import json
 import argparse
+import math
 
 import cv2
 import time
 from PIL import Image
 from openai import OpenAI
+
+from tracking_stage import (
+    SAM2VideoTracker,
+    detect_shots,
+    fill_missing_boxes,
+    identify_bad_track_frames,
+    plan_smoothed_crops,
+)
 
 
 # --------------------------- IO: test index ---------------------------
@@ -101,10 +111,13 @@ def compute_crop_size(W, H, tw, th):
     target = float(tw) / float(th)
     if W / float(H) >= target:        # source wider than target -> full height
         ch = H
-        cw = min(int(round(H * target)), W)
+        # Width is submitted as an integer; floor keeps the derived height legal.
+        cw = min(int(math.floor(H * target)), W)
     else:                              # source taller than target -> full width
         cw = W
-        ch = min(int(round(W / target)), H)
+        # ceil is only used for clamping y; evaluator derives the exact height
+        # from submitted width, so this prevents a fractional-pixel overflow.
+        ch = min(int(math.ceil(W / target)), H)
     return max(1, cw), max(1, ch)
 
 
@@ -172,6 +185,42 @@ def parse_focus_norm(text, W=None, H=None):
         return max(0.0, min(1.0, n))
 
     return [_norm(cx, W), _norm(cy, H)]
+
+
+def parse_subject_box(text, W, H):
+    """Parse Qwen subject_box=[x1,y1,x2,y2] into source-pixel coordinates."""
+    if not isinstance(text, str):
+        return None
+    candidate = None
+    try:
+        objects = [json.loads(text)]
+    except Exception:
+        objects = []
+    for match in re.finditer(r"\{[^{}]*\}", text, re.S):
+        try:
+            objects.append(json.loads(match.group(0)))
+        except Exception:
+            continue
+    for obj in objects:
+        value = obj.get("subject_box") if isinstance(obj, dict) else None
+        if isinstance(value, (list, tuple)) and len(value) == 4:
+            try:
+                candidate = [float(item) for item in value]
+            except (TypeError, ValueError):
+                continue
+    if candidate is None or not all(math.isfinite(item) for item in candidate):
+        return None
+    x1, y1, x2, y2 = candidate
+    # Qwen is instructed to use 0..1000; also tolerate normalized 0..1.
+    if max(abs(x1), abs(x2)) <= 1.5 and max(abs(y1), abs(y2)) <= 1.5:
+        x1, x2, y1, y2 = x1 * W, x2 * W, y1 * H, y2 * H
+    elif max(abs(x1), abs(x2), abs(y1), abs(y2)) <= 1000.0:
+        x1, x2, y1, y2 = x1 * W / 1000.0, x2 * W / 1000.0, y1 * H / 1000.0, y2 * H / 1000.0
+    x1, x2 = max(0.0, min(x1, W - 1.0)), max(1.0, min(x2, float(W)))
+    y1, y2 = max(0.0, min(y1, H - 1.0)), max(1.0, min(y2, float(H)))
+    if x2 <= x1 + 1.0 or y2 <= y1 + 1.0:
+        return None
+    return [x1, y1, x2, y2]
 
 
 def parse_segments_sec(text):
@@ -393,17 +442,13 @@ class QwenVL:
             "properties": {
                 "center": {
                     "type": "array",
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "number"
-                        }
-                    }
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "number"}
                 }
             },
-            "required": [
-                "center"
-            ]
+            "required": ["center"],
+            "additionalProperties": False,
         }
         ## Use video url in the payload
         chat_completion_from_url = self.client.chat.completions.create(
@@ -425,6 +470,47 @@ class QwenVL:
 
         raw = {"content":chat_completion_from_url.choices[0].message.content,"reasoning":chat_completion_from_url.choices[0].message.reasoning}
         return raw # 未做健壮性检查
+
+    def predict_subject_box(self, pil_img, target_ratio, max_new_tokens=256):
+        """Select the semantic subject and return a box for SAM 2 prompting."""
+        tw, th = map(int, target_ratio)
+        prompt = (
+            "This frame belongs to a highlight clip that will be reframed to %d:%d. "
+            "Select the single most important visible subject or the compact group "
+            "that must remain in the crop. Return its tight bounding box using "
+            "normalized integer coordinates 0~1000 as [x1,y1,x2,y2]. "
+            "Output JSON only: {\"subject_box\":[x1,y1,x2,y2],"
+            "\"subject\":\"short description\"}." % (tw, th)
+        )
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="JPEG", quality=95)
+        image_url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
+        schema = {
+            "type": "object",
+            "properties": {
+                "subject_box": {
+                    "type": "array", "minItems": 4, "maxItems": 4,
+                    "items": {"type": "number"},
+                },
+                "subject": {"type": "string"},
+            },
+            "required": ["subject_box", "subject"],
+            "additionalProperties": False,
+        }
+        response = self.client.chat.completions.create(
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]}],
+            model=self.model,
+            max_completion_tokens=max_new_tokens,
+            response_format={"type": "json_schema", "json_schema": {
+                "name": "tracking_subject", "schema": schema,
+            }},
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        message = response.choices[0].message
+        return {"content": message.content, "reasoning": getattr(message, "reasoning", None)}
 
 # --------------------------- Segment processing ---------------------------
 def crop_keyframes(model, video_path, seg, target_ratio, stride, W, H, cw, ch,
@@ -463,6 +549,107 @@ def crop_keyframes(model, video_path, seg, target_ratio, stride, W, H, cw, ch,
         key_boxes = [cb, cb]
     return key_frames, key_boxes
 
+
+def _linear_fallback_predictions(model, video_path, seg, target_ratio, stride,
+                                 W, H, cw, ch, raw_log, vid):
+    kfs, kbs = crop_keyframes(
+        model, video_path, seg, target_ratio, stride, W, H, cw, ch,
+        raw_log, vid, max_new_tokens=128)
+    dense = densify_boxes(seg[0], seg[1], kfs, kbs)
+    return [{"frame": int(frame),
+             "bboxes": [int(dense[frame][0]), int(dense[frame][1]), int(dense[frame][2])]}
+            for frame in range(seg[0], seg[1] + 1) if frame in dense]
+
+
+def track_segment(model, tracker, video_path, seg, target_ratio, W, H,
+                  raw_log, vid, args, cw, ch):
+    """Qwen box initialization + shot-local SAM 2 propagation + crop planning."""
+    shots = detect_shots(video_path, seg, args.scene_threshold, args.scene_min_frames)
+    predictions = []
+    scales = tuple(float(item) for item in args.crop_scales.split(",") if item.strip())
+    margins = (args.margin_left, args.margin_right, args.margin_top, args.margin_bottom)
+    for shot_start, shot_end in shots:
+        try:
+            anchor_frame = extract_frames(video_path, [shot_start]).get(shot_start)
+            if anchor_frame is None:
+                raise RuntimeError("cannot decode shot anchor")
+            pil = Image.fromarray(cv2.cvtColor(anchor_frame, cv2.COLOR_BGR2RGB))
+            raw = model.predict_subject_box(pil, target_ratio, args.subject_max_tokens)
+            content = raw.get("content") if isinstance(raw, dict) else None
+            anchor_box = parse_subject_box(content, W, H)
+            if anchor_box is None:
+                raise ValueError("Qwen subject_box is missing or invalid")
+            raw_log.write(json.dumps({
+                "video_id": vid, "frame": shot_start, "stage": "tracking_anchor",
+                "shot": [shot_start, shot_end], "subject_box": anchor_box, "raw": raw,
+            }, ensure_ascii=False) + "\n")
+
+            boxes = tracker.track_range(
+                video_path, shot_start, shot_end, anchor_box, (W, H))
+            bad_before = identify_bad_track_frames(
+                boxes, shot_start, shot_end, (W, H),
+                args.min_mask_area_ratio, args.max_mask_area_ratio,
+                args.max_area_change, args.max_center_jump)
+
+            # A single recovery pass starts at the first unreliable frame. It
+            # creates an independent SAM 2 state, so bad memory is not reused.
+            reinitialized_at = None
+            if bad_before and args.tracking_reinit > 0:
+                reinitialized_at = bad_before[0]
+                recovery_frame = extract_frames(video_path, [reinitialized_at]).get(reinitialized_at)
+                if recovery_frame is not None:
+                    recovery_pil = Image.fromarray(cv2.cvtColor(recovery_frame, cv2.COLOR_BGR2RGB))
+                    recovery_raw = model.predict_subject_box(
+                        recovery_pil, target_ratio, args.subject_max_tokens)
+                    recovery_content = recovery_raw.get("content") if isinstance(recovery_raw, dict) else None
+                    recovery_box = parse_subject_box(recovery_content, W, H)
+                    if recovery_box is not None:
+                        boxes.update(tracker.track_range(
+                            video_path, reinitialized_at, shot_end,
+                            recovery_box, (W, H)))
+                        raw_log.write(json.dumps({
+                            "video_id": vid, "frame": reinitialized_at,
+                            "stage": "tracking_reinit", "subject_box": recovery_box,
+                            "raw": recovery_raw,
+                        }, ensure_ascii=False) + "\n")
+
+            bad_after = identify_bad_track_frames(
+                boxes, shot_start, shot_end, (W, H),
+                args.min_mask_area_ratio, args.max_mask_area_ratio,
+                args.max_area_change, args.max_center_jump)
+            # Invalid frames are treated as missing before nearest-valid fill.
+            for frame in bad_after:
+                boxes[frame] = None
+            boxes = fill_missing_boxes(boxes, shot_start, shot_end, anchor_box)
+            crops = plan_smoothed_crops(
+                boxes, shot_start, shot_end, (W, H), target_ratio,
+                scales=scales, margins=margins,
+                center_alpha=args.center_alpha, width_alpha=args.width_alpha)
+            for frame in range(shot_start, shot_end + 1):
+                x, y, width, _ = crops[frame]
+                predictions.append({"frame": int(frame),
+                                    "bboxes": [int(x), int(y), int(width)]})
+            raw_log.write(json.dumps({
+                "video_id": vid, "stage": "tracking_summary",
+                "shot": [shot_start, shot_end], "bad_before": len(bad_before),
+                "bad_after": len(bad_after), "reinitialized_at": reinitialized_at,
+            }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print("    [tracking failed] %s#%d-%d -> %s" %
+                  (vid, shot_start, shot_end, exc))
+            if args.tracking_fallback == "error":
+                raise
+            if args.tracking_fallback == "linear":
+                predictions.extend(_linear_fallback_predictions(
+                    model, video_path, (shot_start, shot_end), target_ratio,
+                    args.crop_stride, W, H, cw, ch, raw_log, vid))
+            else:
+                center = center_to_box(0.5, 0.5, W, H, cw, ch)
+                predictions.extend({"frame": frame,
+                                    "bboxes": center[:3]}
+                                   for frame in range(shot_start, shot_end + 1))
+    return predictions
+
 # --------------------------- Main ---------------------------
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -486,7 +673,49 @@ def main():
     ap.add_argument("--dtype", default="auto")
     ap.add_argument("--min-pixels", type=int, default=None)
     ap.add_argument("--max-pixels", type=int, default=None)
+    ap.add_argument("--stage2-backend", choices=("sam2", "linear"), default="sam2",
+                    help="sam2: Qwen box + video tracking; linear: original baseline")
+    ap.add_argument("--sam2-config", default="configs/sam2.1/sam2.1_hiera_s.yaml",
+                    help="SAM 2 Hydra model config")
+    ap.add_argument("--sam2-checkpoint", default=None,
+                    help="local SAM 2.1 checkpoint path (required for sam2 backend)")
+    ap.add_argument("--sam2-device", default="cuda")
+    ap.add_argument("--sam2-amp-dtype", choices=("bfloat16", "float16", "none"),
+                    default="bfloat16")
+    ap.add_argument("--sam2-vos-optimized", action="store_true")
+    ap.add_argument("--scene-threshold", type=float, default=27.0)
+    ap.add_argument("--scene-min-frames", type=int, default=15)
+    ap.add_argument("--subject-max-tokens", type=int, default=256)
+    ap.add_argument("--tracking-reinit", type=int, choices=(0, 1), default=1,
+                    help="one Qwen/SAM2 reinitialization after detected drift")
+    ap.add_argument("--tracking-fallback", choices=("linear", "center", "error"),
+                    default="linear")
+    ap.add_argument("--min-mask-area-ratio", type=float, default=0.0005)
+    ap.add_argument("--max-mask-area-ratio", type=float, default=0.70)
+    ap.add_argument("--max-area-change", type=float, default=4.0)
+    ap.add_argument("--max-center-jump", type=float, default=0.20)
+    ap.add_argument("--crop-scales", default="0.55,0.70,0.85,1.00")
+    ap.add_argument("--margin-left", type=float, default=0.20)
+    ap.add_argument("--margin-right", type=float, default=0.20)
+    ap.add_argument("--margin-top", type=float, default=0.15)
+    ap.add_argument("--margin-bottom", type=float, default=0.30)
+    ap.add_argument("--center-alpha", type=float, default=0.25)
+    ap.add_argument("--width-alpha", type=float, default=0.15)
     args = ap.parse_args()
+
+    if args.scene_min_frames < 1:
+        ap.error("--scene-min-frames must be >= 1")
+    if not 0 < args.center_alpha <= 1 or not 0 < args.width_alpha <= 1:
+        ap.error("smoothing alphas must be in (0,1]")
+    try:
+        crop_scales = [float(item) for item in args.crop_scales.split(",") if item.strip()]
+    except ValueError:
+        ap.error("--crop-scales must be comma-separated numbers")
+    if not crop_scales or any(item <= 0 or item > 1 for item in crop_scales):
+        ap.error("--crop-scales values must be in (0,1]")
+    if any(value < 0 for value in (args.margin_left, args.margin_right,
+                                    args.margin_top, args.margin_bottom)):
+        ap.error("crop margins must be non-negative")
 
     index = load_index(args.index)
     if args.num_videos > 0:
@@ -497,6 +726,11 @@ def main():
     model = QwenVL(args.model, device_map=args.device_map, dtype=args.dtype,
                    min_pixels=args.min_pixels, max_pixels=args.max_pixels,
                    enable_thinking=args.enable_thinking)
+    tracker = None
+    if args.stage2_backend == "sam2":
+        tracker = SAM2VideoTracker(
+            args.sam2_config, args.sam2_checkpoint, args.sam2_device,
+            args.sam2_amp_dtype, args.sam2_vos_optimized)
 
     raw_path = args.out + ".raw.jsonl"
     n_lines = 0
@@ -532,20 +766,14 @@ def main():
             # Stage 2: per-frame re-framing inside each segment.
             predictions = []
             for seg in segments:
-                kfs, kbs = crop_keyframes(
-                    model, video_path, seg, target_ratio, args.crop_stride,
-                    W, H, cw, ch, raw_log, vid,max_new_tokens=9600)
-                dense = densify_boxes(seg[0], seg[1], kfs, kbs)
-                for f in range(seg[0], seg[1] + 1):
-                    box = dense.get(f)
-                    if not box:
-                        continue
-                    x, y, w, _h = box
-                    # submit TRIPLET [x, y, w]; height is derived by evaluator
-                    predictions.append({"frame": int(f),
-                                        "bboxes": [int(round(x)),
-                                                   int(round(y)),
-                                                   int(round(w))]})
+                if args.stage2_backend == "sam2":
+                    predictions.extend(track_segment(
+                        model, tracker, video_path, seg, target_ratio,
+                        W, H, raw_log, vid, args, cw, ch))
+                else:
+                    predictions.extend(_linear_fallback_predictions(
+                        model, video_path, seg, target_ratio,
+                        args.crop_stride, W, H, cw, ch, raw_log, vid))
             predictions.sort(key=lambda r: r["frame"])
             rec = {"video_id": vid,
                    "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
