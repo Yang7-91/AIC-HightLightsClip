@@ -54,6 +54,10 @@ def load_index(index_path):
 
 
 def video_meta(video_path):
+    """获取视频元信息
+
+    return: n：视频总帧数, fps：视频帧率, w：宽, h：高
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return 0, 0.0, 0, 0
@@ -105,8 +109,17 @@ def compute_crop_size(W, H, tw, th):
 
 
 def center_to_box(cx, cy, W, H, cw, ch):
-    """Normalized center (0~1) -> pixel crop box [x, y, cw, ch], clamped."""
-    px = cx * W - cw / 2.0
+    """Normalized center (0~1) -> pixel crop box [x, y, cw, ch], clamped.
+
+    params:
+        cx: 裁剪x坐标，已归一化至(0~1)
+        cy: 裁剪y坐标，已归一化至(0~1)
+        W: 源帧宽度
+        H: 源帧高度
+        cw: 裁剪宽度
+        ch: 裁剪高度
+    """
+    px = cx * W - cw / 2.0 # 中心点移动至左上角，除以2
     py = cy * H - ch / 2.0
     px = int(round(max(0, min(px, W - cw))))
     py = int(round(max(0, min(py, H - ch))))
@@ -146,6 +159,7 @@ def parse_focus_norm(text, W=None, H=None):
         return None
     cx, cy = cand
 
+    # TODO 兼容不同的输出格式，进行归一化，有点问题需要修改
     def _norm(v, size):
         if v <= 1.5:
             n = v
@@ -191,8 +205,14 @@ def parse_segments_sec(text):
 
 
 def sec_segments_to_frames(segs_sec, fps, n_frames):
+    """ 将高光以秒分割的区间转换成帧数区间索引
+    params:
+        segs_sec: 高光时间区间，以秒单位
+        fps: 视频帧率
+        n_frames: 视频总帧数
+    """
     out = []
-    for s, e in segs_sec:
+    for s, e in segs_sec: # 保证每个区间大小、顺序合法
         f0 = int(round(min(s, e) * fps))
         f1 = int(round(max(s, e) * fps))
         f0 = max(0, min(f0, n_frames - 1))
@@ -203,7 +223,13 @@ def sec_segments_to_frames(segs_sec, fps, n_frames):
 
 
 def merge_segments(segs_frame, n_frames):
-    """Clamp to [0, n_frames-1], ensure a<=b, merge overlapping/adjacent."""
+    """Clamp to [0, n_frames-1], ensure a<=b, merge overlapping/adjacent.
+    params:
+        segs_frame: 以帧区间索引的高光，例如[[10,20],[20,40],[50,60]]
+        n_frames: 视频总帧数
+    return:
+        元组数组，如：[(10,40),(50,60)]
+    """
     if n_frames <= 0 or not segs_frame:
         return []
     segs = []
@@ -215,7 +241,7 @@ def merge_segments(segs_frame, n_frames):
     segs.sort()
     merged = [segs[0]]
     for a, b in segs[1:]:
-        if a <= merged[-1][1] + 1:
+        if a <= merged[-1][1] + 1: # 后一个帧区间的开始帧小于等于前一个帧区间的(结尾帧+1)，则合并两个区间
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
@@ -234,7 +260,7 @@ def densify_boxes(seg_start, seg_end, key_frames, key_boxes):
     kfs = [p[0] for p in pts]
     kbs = [p[1] for p in pts]
     out = {}
-    for f in range(seg_start, seg_end + 1):
+    for f in range(seg_start, seg_end + 1): # 对于位于[seg_start, seg_end]的中间帧，直接使用右侧关键帧的bbox
         if f <= kfs[0]:
             out[f] = kbs[0]
         elif f >= kfs[-1]:
@@ -343,7 +369,7 @@ class QwenVL:
             pil.save(
                 buffer,
                 format="JPEG",
-                quality=90
+                quality=90 # 可控的压缩质量
             )
 
             base64_image = base64.b64encode(
@@ -351,6 +377,7 @@ class QwenVL:
             ).decode("utf-8")
 
             return f"data:image/jpeg;base64,{base64_image}"
+
         image_url = pil_to_data_url(pil_img)
         messages = [
             {
@@ -400,7 +427,7 @@ class QwenVL:
         return raw # 未做健壮性检查
 
 # --------------------------- Segment processing ---------------------------
-def crop_keyframes(model, video_path, seg, target, stride, W, H, cw, ch,
+def crop_keyframes(model, video_path, seg, target_ratio, stride, W, H, cw, ch,
                    raw_log, vid, max_new_tokens=128):
     """Sample keyframes inside a segment and predict centers -> (frames, boxes)."""
     s, e = seg
@@ -415,7 +442,7 @@ def crop_keyframes(model, video_path, seg, target, stride, W, H, cw, ch,
             continue
         pil = Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
         try:
-            raw = model.predict_focus(pil, target, max_new_tokens=max_new_tokens)
+            raw = model.predict_focus(pil, target_ratio, max_new_tokens=max_new_tokens)
             if raw_log is not None:
                 raw_log.write(json.dumps(
                     {"video_id": vid, "frame": f, "stage": "crop", "raw": raw},
@@ -430,7 +457,7 @@ def crop_keyframes(model, video_path, seg, target, stride, W, H, cw, ch,
                 key_boxes.append(center_to_box(fc[0], fc[1], W, H, cw, ch))
         except Exception as ex:
             print("    [crop failed] %s#%d -> %s" % (vid, f, ex))
-    if not key_frames:  # fallback: center placement keeps the segment non-empty
+    if not key_frames:  # fallback: center placement keeps the segment non-empty。此时降级为最原始得兜底策略，所有帧直接取图像中心点为裁剪中心
         key_frames = [s, e]
         cb = center_to_box(0.5, 0.5, W, H, cw, ch)
         key_boxes = [cb, cb]
@@ -475,17 +502,17 @@ def main():
     n_lines = 0
     with open(args.out, "w", encoding="utf-8") as fout, \
             open(raw_path, "w", encoding="utf-8") as raw_log:
-        for vi, (vid, target) in enumerate(index, 1):
+        for vi, (vid, target_ratio) in enumerate(index, 1):
             video_path = os.path.join(args.video_dir, vid + ".mp4")
             if not os.path.exists(video_path):
                 print("  [skip] no video: %s" % video_path)
                 fout.write(json.dumps(
-                    {"video_id": vid, "targetRatioWH": [int(target[0]),
-                     int(target[1])], "predictions": []},
+                    {"video_id": vid, "targetRatioWH": [int(target_ratio[0]),
+                     int(target_ratio[1])], "predictions": []},
                     ensure_ascii=False) + "\n")
                 continue
             n_frames, fps, W, H = video_meta(video_path)
-            cw, ch = compute_crop_size(W, H, target[0], target[1])
+            cw, ch = compute_crop_size(W, H, target_ratio[0], target_ratio[1])
 
             # Stage 1: highlight localization (model only).
             segs_sec, raw = model.detect_highlights(
@@ -495,7 +522,9 @@ def main():
                 {"video_id": vid, "stage": "detect", "raw": raw},
                 ensure_ascii=False) + "\n")
             segments = merge_segments(
-                sec_segments_to_frames(segs_sec, fps, n_frames), n_frames)
+                sec_segments_to_frames(segs_sec, fps, n_frames),
+                n_frames
+            )
 
             print("  [%d/%d] %s %dx%d fps=%.2f frames=%d crop=%dx%d segs=%s"
                   % (vi, len(index), vid, W, H, fps, n_frames, cw, ch, segments))
@@ -504,7 +533,7 @@ def main():
             predictions = []
             for seg in segments:
                 kfs, kbs = crop_keyframes(
-                    model, video_path, seg, target, args.crop_stride,
+                    model, video_path, seg, target_ratio, args.crop_stride,
                     W, H, cw, ch, raw_log, vid,max_new_tokens=9600)
                 dense = densify_boxes(seg[0], seg[1], kfs, kbs)
                 for f in range(seg[0], seg[1] + 1):
@@ -519,7 +548,7 @@ def main():
                                                    int(round(w))]})
             predictions.sort(key=lambda r: r["frame"])
             rec = {"video_id": vid,
-                   "targetRatioWH": [int(target[0]), int(target[1])],
+                   "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
                    "predictions": predictions}
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_lines += len(predictions)
