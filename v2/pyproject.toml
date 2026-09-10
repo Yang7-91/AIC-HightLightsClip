@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-highlight"
+version = "0.1.0"
+description = "Five-stage video highlight inference pipeline"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+  "scenedetect==0.7.1",
+  "PyYAML>=6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.unittest]
+start-directory = "tests"

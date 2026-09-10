@@ -6,12 +6,12 @@ Baseline (Qwen3.5-4B-awq-int4 two-stage) for the Highlight Video Re-framing task
 
 本基线仅读取公开的测试索引（video_id + 目标画幅）与输入视频，不依赖任何真值标注。
 
-Two stages 两阶段:
-  阶段1 高光定位：把整段视频喂给视频大模型，预测高光时间区间（秒）。
+Persisted stages 分阶段流水线:
+  Stage 1A：thinking 模式下预测高光时间区间并写入 JSONL。
+  Stage 1B：读取 Stage 1A JSONL，切分镜头并用 Qwen 生成主体锚点框。
+  Stage 2：仅读取 Stage 1B JSONL 与原视频，用 SAM 2 跟踪和生成构图框。
 
-  阶段2 逐帧重构图：Qwen在每个镜头选择重要主体并给出提示框，SAM 2
-        在镜头内传播逐帧掩码，再生成动态尺度、平滑且合法的构图框。
-        可用 --stage2-backend linear 回到原中心点+线性插值基线。
+运行模式：--run-stage all / stage1a / stage1b / stage2。
 
 输出（提交格式，每行一个视频对象）:
     {"video_id": "0", "targetRatioWH": [16, 9],
@@ -35,7 +35,6 @@ import math
 import cv2
 import time
 from PIL import Image
-from openai import OpenAI
 
 from tracking_stage import (
     SAM2VideoTracker,
@@ -45,12 +44,17 @@ from tracking_stage import (
     plan_smoothed_crops,
 )
 
+STAGE1A_SCHEMA = "video-clip.stage1a.v1"
+STAGE1B_SCHEMA = "video-clip.stage1b.v1"
+
 
 # --------------------------- IO: test index ---------------------------
 def load_index(index_path):
-    """Read public test index -> [(video_id, (tw, th)), ...].
+    """Read public test index -> [(video_id, (tw, th)), ...].Each item: {"video_id": "0", "targetRatioWH": [16, 9]}.
+    注意：test_index是预先提供的绝对合法的索引。
 
-    Each item: {"video_id": "0", "targetRatioWH": [16, 9]}.
+    return:
+        所有视频的vid以及比例，[(vid, (trw, trh)),...]
     """
     with open(index_path, "r", encoding="utf-8") as f:
         items = json.load(f)
@@ -58,15 +62,103 @@ def load_index(index_path):
     for it in items:
         vid = str(it["video_id"])
         tr = it.get("targetRatioWH", [16, 9])
-        tw, th = float(tr[0]), float(tr[1])
-        out.append((vid, (tw, th)))
+        trw, trh = float(tr[0]), float(tr[1])
+        out.append((vid, (trw, trh)))
     return out
 
 
-def video_meta(video_path):
-    """获取视频元信息
+def read_jsonl(path, expected_schema=None):
+    """Read JSONL records and reject malformed, duplicate or wrong-stage data."""
+    records = []
+    seen = set()
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError("%s:%d: invalid JSON: %s" % (path, line_number, exc)) from exc
+            if not isinstance(record, dict):
+                raise ValueError("%s:%d: each JSONL line must be an object" % (path, line_number))
+            video_id = str(record.get("video_id", ""))
+            if not video_id:
+                raise ValueError("%s:%d: missing video_id" % (path, line_number))
+            if video_id in seen:
+                raise ValueError("%s:%d: duplicate video_id=%s" % (path, line_number, video_id))
+            if expected_schema and record.get("schema_version") != expected_schema:
+                raise ValueError("%s:%d: expected schema_version=%s, got %r" %
+                    (path, line_number, expected_schema, record.get("schema_version")))
+            record["video_id"] = video_id
+            records.append(record)
+            seen.add(video_id)
+    return records
 
-    return: n：视频总帧数, fps：视频帧率, w：宽, h：高
+
+def _ensure_parent(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _video_record_base(video_id, video_path, target_ratio, n_frames, fps, W, H):
+    """返回格式化的视频信息字典"""
+    return {
+        "video_id": str(video_id),
+        "video_name": os.path.basename(video_path),
+        "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
+        "video_meta": {
+            "width": int(W), "height": int(H), "fps": float(fps),
+            "num_frames": int(n_frames),
+        },
+    }
+
+
+def _record_target_ratio(record):
+    """读取视频信息字典里的比例信息
+    params:
+        record: 视频信息字典
+    return:
+        trw,trh
+    """
+    value = record.get("targetRatioWH")
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("video_id=%s: invalid targetRatioWH" % record.get("video_id"))
+    trw, trh = float(value[0]), float(value[1])
+    if trw <= 0 or trh <= 0:
+        raise ValueError("video_id=%s: targetRatioWH must be positive" % record.get("video_id"))
+    return trw, trh
+
+
+def _validate_video_meta(record, actual):
+    """Prevent a stage file from being applied to a different video revision.
+    params:
+        record: 从视频中获取的信息
+        actual: 视频实际信息
+    """
+    expected = record.get("video_meta") or {}
+    n_frames, fps, width, height = actual
+    exact_fields = {
+        "num_frames": int(n_frames), "width": int(width), "height": int(height),
+    }
+    # 验证帧数、宽、高值一致
+    for key, value in exact_fields.items():
+        if int(expected.get(key, -1)) != value:
+            raise ValueError("video_id=%s: video_meta.%s mismatch: stage=%r actual=%r" % (record.get("video_id"), key, expected.get(key), value))
+    expected_fps = float(expected.get("fps", -1.0))
+    # 验证帧率值一致
+    if not math.isclose(expected_fps, float(fps), rel_tol=1e-5, abs_tol=1e-3):
+        raise ValueError("video_id=%s: video_meta.fps mismatch: stage=%r actual=%r" % (record.get("video_id"), expected.get("fps"), fps))
+
+
+def video_meta(video_path):
+    """根据视频地址获取视频元信息
+
+    return:
+        n：视频总帧数
+        fps：视频帧率
+        w：宽
+        h：高
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -81,7 +173,17 @@ def video_meta(video_path):
 
 
 def extract_frames(video_path, frame_ids):
-    """Read BGR frames by id -> {frame: ndarray}. Sequential read avoids seeks."""
+    """
+    Read BGR frames by id -> {frame: ndarray}. Sequential read avoids seeks.
+    按顺序读取，直至读到所需帧末尾，由于视频存储格式特性，随机读帧实际上也会有一大段的顺序读取，
+    所以直接顺序读反而最省时。
+
+    params:
+        video_path: 视频地址
+        frame_ids: 所需帧区间数组，[fr1,fr2,fr3,fr4,...]
+    return:
+        帧数据列
+    """
     frame_ids = sorted(set(int(f) for f in frame_ids))
     out = {}
     cap = cv2.VideoCapture(video_path)
@@ -104,7 +206,7 @@ def extract_frames(video_path, frame_ids):
 
 
 # --------------- Geometry: crop size + center placement ---------------
-def compute_crop_size(W, H, tw, th):
+def compute_crop_size_max(W, H, tw, th):
     """Largest target-ratio rectangle that fits inside the source frame."""
     if tw <= 0 or th <= 0 or W <= 0 or H <= 0:
         return W, H
@@ -125,14 +227,16 @@ def center_to_box(cx, cy, W, H, cw, ch):
     """Normalized center (0~1) -> pixel crop box [x, y, cw, ch], clamped.
 
     params:
-        cx: 裁剪x坐标，已归一化至(0~1)
-        cy: 裁剪y坐标，已归一化至(0~1)
+        cx: 裁剪坐标中心点x，已归一化至(0~1)
+        cy: 裁剪坐标中心点y，已归一化至(0~1)
         W: 源帧宽度
         H: 源帧高度
         cw: 裁剪宽度
         ch: 裁剪高度
+    return:
+        [px, py, cw, ch]，裁剪像素左上角起点坐标与裁剪的宽度、高度
     """
-    px = cx * W - cw / 2.0 # 中心点移动至左上角，除以2
+    px = cx * W - cw / 2.0 # 中心点移动至左上角，除以2，得到裁剪像素左上角起点坐标
     py = cy * H - ch / 2.0
     px = int(round(max(0, min(px, W - cw))))
     py = int(round(max(0, min(py, H - ch))))
@@ -225,6 +329,8 @@ def parse_subject_box(text, W, H):
 
 def parse_segments_sec(text):
     """Parse highlight intervals [[start_sec, end_sec], ...]. [] on failure."""
+    if not isinstance(text, str):
+        return []
     for m in re.finditer(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.S):
         try:
             obj = json.loads(m.group(0))
@@ -301,7 +407,7 @@ def lerp_box(b0, b1, t):
     return [int(round(b0[i] + (b1[i] - b0[i]) * t)) for i in range(4)]
 
 
-def densify_boxes(seg_start, seg_end, key_frames, key_boxes):
+def densify_boxes_linear(seg_start, seg_end, key_frames, key_boxes):
     """Per-frame boxes inside a segment by linear interpolation of keyframes."""
     if not key_frames:
         return {}
@@ -328,6 +434,9 @@ def densify_boxes(seg_start, seg_end, key_frames, key_boxes):
 class QwenVL:
     def __init__(self, model_path, device_map="auto", dtype="auto",
                  min_pixels=None, max_pixels=None, enable_thinking=False):
+        # Lazy import keeps the pure Stage 2 environment independent of OpenAI/vLLM.
+        from openai import OpenAI
+
         self.enable_thinking = enable_thinking
         openai_api_key = "EMPTY"
         openai_api_base = "http://172.25.254.120:8000/v1/"
@@ -390,19 +499,20 @@ class QwenVL:
                 }
             },
             extra_body={
-                "chat_template_kwargs": {"enable_thinking": True},
+                "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
                 "thinking_token_budget": 8000
             }
         )
 
-        raw = chat_completion_from_url.choices[0].message
-        if raw is None:
-            return []
-        raw = {"content":chat_completion_from_url.choices[0].message.content,"reasoning":chat_completion_from_url.choices[0].message.reasoning}
+        message = chat_completion_from_url.choices[0].message
+        if message is None:
+            return [], {"content": None, "reasoning": None}
+        raw = {"content": message.content,
+               "reasoning": getattr(message, "reasoning", None)}
         return parse_segments_sec(raw["content"]), raw
 
     def predict_focus(self, pil_img, target_ratio, max_new_tokens=128):
-        tw, th = target_ratio
+        trw, trh = target_ratio
         prompt = (
             "Below is a video frame to be re-framed (cropped) to %d:%d.\n"
             "Point out the center of the most important subject / region to "
@@ -410,21 +520,12 @@ class QwenVL:
             "horizontal (0=left, 1000=right), y is vertical (0=top, "
             "1000=bottom).\n"
             "Output ONLY JSON format text, do not use markdown,do not output ```json,no extra text or symbol strictly, example: {\"center\": [x, y]}"
-            % (int(tw), int(th))
+            % (int(trw), int(trh))
         )
         def pil_to_data_url(pil):
             buffer = io.BytesIO()
-
-            pil.save(
-                buffer,
-                format="JPEG",
-                quality=90 # 可控的压缩质量
-            )
-
-            base64_image = base64.b64encode(
-                buffer.getvalue()
-            ).decode("utf-8")
-
+            pil.save(buffer,format="JPEG",quality=90) # 可控的压缩质量
+            base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
             return f"data:image/jpeg;base64,{base64_image}"
 
         image_url = pil_to_data_url(pil_img)
@@ -464,7 +565,7 @@ class QwenVL:
             },
             extra_body={
                 "chat_template_kwargs": {"enable_thinking": False},
-                "thinking_token_budget": 4000
+                # "thinking_token_budget": 4000
             }
         )
 
@@ -530,9 +631,12 @@ def crop_keyframes(model, video_path, seg, target_ratio, stride, W, H, cw, ch,
         try:
             raw = model.predict_focus(pil, target_ratio, max_new_tokens=max_new_tokens)
             if raw_log is not None:
-                raw_log.write(json.dumps(
-                    {"video_id": vid, "frame": f, "stage": "crop", "raw": raw},
-                    ensure_ascii=False) + "\n")
+                raw_log.write(
+                    json.dumps(
+                        {"video_id": vid, "frame": f, "stage": "crop", "raw": raw},
+                        ensure_ascii=False
+                    ) + "\n"
+                )
             content = raw.get("content")
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("模型返回的 content 为空或不是字符串")
@@ -555,7 +659,7 @@ def _linear_fallback_predictions(model, video_path, seg, target_ratio, stride,
     kfs, kbs = crop_keyframes(
         model, video_path, seg, target_ratio, stride, W, H, cw, ch,
         raw_log, vid, max_new_tokens=128)
-    dense = densify_boxes(seg[0], seg[1], kfs, kbs)
+    dense = densify_boxes_linear(seg[0], seg[1], kfs, kbs)
     return [{"frame": int(frame),
              "bboxes": [int(dense[frame][0]), int(dense[frame][1]), int(dense[frame][2])]}
             for frame in range(seg[0], seg[1] + 1) if frame in dense]
@@ -650,17 +754,264 @@ def track_segment(model, tracker, video_path, seg, target_ratio, W, H,
                                    for frame in range(shot_start, shot_end + 1))
     return predictions
 
+
+def track_precomputed_shot(tracker, video_path, shot, target_ratio, W, H,
+                           raw_log, vid, args):
+    """Pure Stage 2: SAM2 propagation from a Stage 1B subject-box anchor."""
+    shot_start, shot_end = map(int, shot["shot_frame"])
+    anchor_box = shot.get("subject_box")
+    if not isinstance(anchor_box, list) or len(anchor_box) != 4:
+        raise ValueError("missing subject_box for shot [%d,%d]" %
+                         (shot_start, shot_end))
+    anchor_box = [float(value) for value in anchor_box]
+    boxes = tracker.track_range(
+        video_path, shot_start, shot_end, anchor_box, (W, H))
+    bad_frames = identify_bad_track_frames(
+        boxes, shot_start, shot_end, (W, H),
+        args.min_mask_area_ratio, args.max_mask_area_ratio,
+        args.max_area_change, args.max_center_jump)
+    for frame in bad_frames:
+        boxes[frame] = None
+    boxes = fill_missing_boxes(boxes, shot_start, shot_end, anchor_box)
+    scales = tuple(float(item) for item in args.crop_scales.split(",")
+                   if item.strip())
+    margins = (args.margin_left, args.margin_right,
+               args.margin_top, args.margin_bottom)
+    crops = plan_smoothed_crops(
+        boxes, shot_start, shot_end, (W, H), target_ratio,
+        scales=scales, margins=margins,
+        center_alpha=args.center_alpha, width_alpha=args.width_alpha)
+    raw_log.write(json.dumps({
+        "video_id": vid, "stage": "tracking_summary",
+        "shot": [shot_start, shot_end],
+        "anchor_frame": int(shot.get("anchor_frame", shot_start)),
+        "bad_frames": len(bad_frames), "reinitialized_at": None,
+    }, ensure_ascii=False) + "\n")
+    return [
+        {"frame": int(frame),
+         "bboxes": [int(crops[frame][0]), int(crops[frame][1]),
+                    int(crops[frame][2])]}
+        for frame in range(shot_start, shot_end + 1)
+    ]
+
+
+def run_stage1a(index, args, model):
+    """Run thinking-enabled highlight localization and persist its boundary."""
+    _ensure_parent(args.stage1a_jsonl)
+    raw_path = args.stage1a_jsonl + ".raw.jsonl"
+    written = 0
+    with open(args.stage1a_jsonl, "w", encoding="utf-8") as output, \
+            open(raw_path, "w", encoding="utf-8") as raw_log:
+        for position, (vid, target_ratio) in enumerate(index, 1):
+            video_path = os.path.join(args.video_dir, vid + ".mp4")
+            if not os.path.exists(video_path):
+                record = _video_record_base(
+                    vid, video_path, target_ratio, 0, 0.0, 0, 0)
+                record.update({
+                    "schema_version": STAGE1A_SCHEMA,
+                    "segments_sec": [], "segments_frame": [],
+                    "status": "missing_video",
+                    "error": "video not found: %s" % video_path,
+                })
+            else:
+                n_frames, fps, W, H = video_meta(video_path)
+                record = _video_record_base(
+                    vid, video_path, target_ratio, n_frames, fps, W, H)
+                if n_frames <= 0 or fps <= 0 or W <= 0 or H <= 0:
+                    record.update({
+                        "schema_version": STAGE1A_SCHEMA,
+                        "segments_sec": [], "segments_frame": [],
+                        "status": "invalid_video",
+                        "error": "cannot read valid video metadata",
+                    })
+                else:
+                    segs_sec, raw = model.detect_highlights(
+                        video_path, fps_sample=args.detect_fps,
+                        max_new_tokens=args.max_new_tokens)
+                    segments = merge_segments(
+                        sec_segments_to_frames(segs_sec, fps, n_frames), n_frames)
+                    record.update({
+                        "schema_version": STAGE1A_SCHEMA,
+                        "segments_sec": [[float(a), float(b)] for a, b in segs_sec],
+                        "segments_frame": [[int(a), int(b)] for a, b in segments],
+                        "stage1a_config": {
+                            "detect_fps": float(args.detect_fps),
+                            "max_new_tokens": int(args.max_new_tokens),
+                            "enable_thinking": bool(args.enable_thinking),
+                        },
+                        "status": "ok" if segments else "no_highlight",
+                    })
+                    raw_log.write(json.dumps({
+                        "video_id": vid, "stage": "stage1a_detect", "raw": raw,
+                    }, ensure_ascii=False) + "\n")
+            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+            output.flush()
+            raw_log.flush()
+            written += 1
+            print("  [stage1a %d/%d] %s status=%s segments=%s" %
+                  (position, len(index), vid, record["status"],
+                   record.get("segments_frame", [])))
+    print("Stage 1A done: %d videos -> %s" % (written, args.stage1a_jsonl))
+    print("Stage 1A raw outputs -> %s" % raw_path)
+    return read_jsonl(args.stage1a_jsonl, STAGE1A_SCHEMA)
+
+
+def run_stage1b(stage1a_records, args, model):
+    """Split highlight ranges into shots and persist Qwen subject anchors."""
+    _ensure_parent(args.stage1b_jsonl)
+    raw_path = args.stage1b_jsonl + ".raw.jsonl"
+    with open(args.stage1b_jsonl, "w", encoding="utf-8") as output, \
+            open(raw_path, "w", encoding="utf-8") as raw_log:
+        for position, source in enumerate(stage1a_records, 1):
+            vid = source["video_id"]
+            target_ratio = _record_target_ratio(source)
+            video_name = source.get("video_name") or (vid + ".mp4")
+            video_path = os.path.join(args.video_dir, video_name)
+            record = {
+                "schema_version": STAGE1B_SCHEMA,
+                "video_id": vid, "video_name": video_name,
+                "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
+                "video_meta": source.get("video_meta", {}),
+                "segments_sec": source.get("segments_sec", []),
+                "segments_frame": source.get("segments_frame", []),
+                "shots": [], "status": source.get("status", "failed"),
+            }
+            if source.get("status") == "ok":
+                if not os.path.exists(video_path):
+                    raise FileNotFoundError("video_id=%s: %s" % (vid, video_path))
+                actual = video_meta(video_path)
+                _validate_video_meta(source, actual)
+                n_frames, _, W, H = actual
+                segments = merge_segments(source.get("segments_frame", []), n_frames)
+                failures = 0
+                for segment in segments:
+                    shots = detect_shots(
+                        video_path, segment, args.scene_threshold,
+                        args.scene_min_frames)
+                    for shot_start, shot_end in shots:
+                        shot_record = {
+                            "segment_frame": [int(segment[0]), int(segment[1])],
+                            "shot_frame": [int(shot_start), int(shot_end)],
+                            "anchor_frame": int(shot_start),
+                        }
+                        try:
+                            frame = extract_frames(video_path, [shot_start]).get(shot_start)
+                            if frame is None:
+                                raise RuntimeError("cannot decode anchor frame")
+                            pil = Image.fromarray(
+                                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            raw = model.predict_subject_box(
+                                pil, target_ratio, args.subject_max_tokens)
+                            content = raw.get("content") if isinstance(raw, dict) else None
+                            anchor_box = parse_subject_box(content, W, H)
+                            if anchor_box is None:
+                                raise ValueError("Qwen subject_box is missing or invalid")
+                            shot_record.update({
+                                "subject_box": [float(value) for value in anchor_box],
+                                "anchor_status": "ok",
+                            })
+                            raw_log.write(json.dumps({
+                                "video_id": vid, "stage": "stage1b_anchor",
+                                "frame": int(shot_start),
+                                "shot": [int(shot_start), int(shot_end)],
+                                "subject_box": anchor_box, "raw": raw,
+                            }, ensure_ascii=False) + "\n")
+                        except Exception as exc:
+                            failures += 1
+                            shot_record.update({
+                                "subject_box": None, "anchor_status": "failed",
+                                "error": str(exc),
+                            })
+                            if args.tracking_fallback == "error":
+                                raise
+                        record["shots"].append(shot_record)
+                record["status"] = "ok" if failures == 0 else "partial"
+            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+            output.flush()
+            raw_log.flush()
+            print("  [stage1b %d/%d] %s status=%s shots=%d" %
+                  (position, len(stage1a_records), vid, record["status"],
+                   len(record["shots"])))
+    print("Stage 1B done: %d videos -> %s" %
+          (len(stage1a_records), args.stage1b_jsonl))
+    print("Stage 1B raw outputs -> %s" % raw_path)
+    return read_jsonl(args.stage1b_jsonl, STAGE1B_SCHEMA)
+
+
+def run_stage2(stage1b_records, args, tracker):
+    """Consume Stage 1B JSONL and run SAM2/crop planning without Qwen."""
+    _ensure_parent(args.out)
+    raw_path = args.out + ".raw.jsonl"
+    prediction_count = 0
+    with open(args.out, "w", encoding="utf-8") as output, \
+            open(raw_path, "w", encoding="utf-8") as raw_log:
+        for position, source in enumerate(stage1b_records, 1):
+            vid = source["video_id"]
+            target_ratio = _record_target_ratio(source)
+            video_name = source.get("video_name") or (vid + ".mp4")
+            video_path = os.path.join(args.video_dir, video_name)
+            predictions = []
+            if source.get("status") in ("ok", "partial"):
+                if not os.path.exists(video_path):
+                    raise FileNotFoundError("video_id=%s: %s" % (vid, video_path))
+                actual = video_meta(video_path)
+                _validate_video_meta(source, actual)
+                _, _, W, H = actual
+                cw, ch = compute_crop_size_max(
+                    W, H, target_ratio[0], target_ratio[1])
+                for shot in source.get("shots", []):
+                    shot_start, shot_end = map(int, shot["shot_frame"])
+                    try:
+                        predictions.extend(track_precomputed_shot(
+                            tracker, video_path, shot, target_ratio, W, H,
+                            raw_log, vid, args))
+                    except Exception as exc:
+                        print("    [stage2 failed] %s#%d-%d -> %s" %
+                              (vid, shot_start, shot_end, exc))
+                        if args.tracking_fallback == "error":
+                            raise
+                        center = center_to_box(0.5, 0.5, W, H, cw, ch)
+                        predictions.extend({
+                            "frame": frame, "bboxes": center[:3]
+                        } for frame in range(shot_start, shot_end + 1))
+            # A malformed upstream file must not create duplicate frame entries.
+            by_frame = {int(item["frame"]): item for item in predictions}
+            predictions = [by_frame[frame] for frame in sorted(by_frame)]
+            result = {
+                "video_id": vid,
+                "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
+                "predictions": predictions,
+            }
+            output.write(json.dumps(result, ensure_ascii=False) + "\n")
+            output.flush()
+            raw_log.flush()
+            prediction_count += len(predictions)
+            print("  [stage2 %d/%d] %s predictions=%d" %
+                  (position, len(stage1b_records), vid, len(predictions)))
+    print("Stage 2 done: %d videos / %d frame predictions -> %s" %
+          (len(stage1b_records), prediction_count, args.out))
+    print("Stage 2 raw outputs -> %s" % raw_path)
+
 # --------------------------- Main ---------------------------
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     there = os.path.dirname("F:\\baiduNetDisk\\baiduNetDiskDownload\\基于视频大模型的通用视频高光剪辑\\基于视频大模型的通用视频高光剪辑\\") #windows格式，绝对路径指明本地文件
     ap = argparse.ArgumentParser(
-        description="Qwen-VL two-stage baseline: highlight localization + re-framing")
+        description="Qwen + SAM2 split pipeline: stage1a, stage1b and stage2")
+    ap.add_argument("--run-stage", choices=("all", "stage1a", "stage1b", "stage2"),
+                    default="all",
+                    help="all runs the three persisted stages in order")
     ap.add_argument("--model", required=False, help="local VL model weights path")
     ap.add_argument("--index", default=os.path.join(here, "test_index.json"),
                     help="public test index (video_id + targetRatioWH)")
     ap.add_argument("--video-dir", default=os.path.join(there, "video"))
     ap.add_argument("--out", default=os.path.join(here, "predictions.jsonl"))
+    ap.add_argument("--stage1a-jsonl",
+                    default=os.path.join(here, "stage1a_segments.jsonl"),
+                    help="Stage 1A output, or Stage 1B input")
+    ap.add_argument("--stage1b-jsonl",
+                    default=os.path.join(here, "stage1b_anchors.jsonl"),
+                    help="Stage 1B output, or Stage 2 input")
     ap.add_argument("--num-videos", type=int, default=0,
                     help="process first N videos, 0 = all")
     ap.add_argument("--crop-stride", type=int, default=15,
@@ -686,10 +1037,10 @@ def main():
     ap.add_argument("--scene-threshold", type=float, default=27.0)
     ap.add_argument("--scene-min-frames", type=int, default=15)
     ap.add_argument("--subject-max-tokens", type=int, default=256)
-    ap.add_argument("--tracking-reinit", type=int, choices=(0, 1), default=1,
-                    help="one Qwen/SAM2 reinitialization after detected drift")
+    ap.add_argument("--tracking-reinit", type=int, choices=(0, 1), default=0,
+                    help="must be 0 in pure Stage 2; no Qwen calls are allowed")
     ap.add_argument("--tracking-fallback", choices=("linear", "center", "error"),
-                    default="linear")
+                    default="error")
     ap.add_argument("--min-mask-area-ratio", type=float, default=0.0005)
     ap.add_argument("--max-mask-area-ratio", type=float, default=0.70)
     ap.add_argument("--max-area-change", type=float, default=4.0)
@@ -717,74 +1068,55 @@ def main():
                                     args.margin_top, args.margin_bottom)):
         ap.error("crop margins must be non-negative")
 
-    index = load_index(args.index)
-    if args.num_videos > 0:
-        index = index[:args.num_videos]
-    # index = [("0",(16,9))]
-    print("To infer: %d videos" % len(index))
+    if args.run_stage in ("all", "stage1a") and not args.enable_thinking:
+        ap.error("Stage 1A requires --enable-thinking")
+    if args.run_stage in ("all", "stage2") and args.tracking_reinit != 0:
+        ap.error(
+            "pure Stage 2 cannot call Qwen for dynamic recovery; "
+            "use --tracking-reinit 0")
+    if args.run_stage in ("all", "stage2") and args.stage2_backend != "sam2":
+        ap.error("the split Stage 2 currently requires --stage2-backend sam2")
+    if args.run_stage in ("all", "stage2") and args.tracking_fallback == "linear":
+        ap.error(
+            "pure Stage 2 cannot run the Qwen-based linear fallback; "
+            "use --tracking-fallback center or error")
 
-    model = QwenVL(args.model, device_map=args.device_map, dtype=args.dtype,
-                   min_pixels=args.min_pixels, max_pixels=args.max_pixels,
-                   enable_thinking=args.enable_thinking)
-    tracker = None
-    if args.stage2_backend == "sam2":
+    if args.run_stage in ("all", "stage1a"):
+        index = load_index(args.index)
+        if args.num_videos > 0:
+            index = index[:args.num_videos]
+        print("Stage 1A input: %d videos" % len(index))
+        model = QwenVL(
+            args.model, device_map=args.device_map, dtype=args.dtype,
+            min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+            enable_thinking=True)
+        stage1a_records = run_stage1a(index, args, model)
+    else:
+        stage1a_records = None
+
+    if args.run_stage in ("all", "stage1b"):
+        if stage1a_records is None:
+            stage1a_records = read_jsonl(args.stage1a_jsonl, STAGE1A_SCHEMA)
+            if args.num_videos > 0:
+                stage1a_records = stage1a_records[:args.num_videos]
+        if args.run_stage == "stage1b":
+            model = QwenVL(
+                args.model, device_map=args.device_map, dtype=args.dtype,
+                min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+                enable_thinking=False)
+        stage1b_records = run_stage1b(stage1a_records, args, model)
+    else:
+        stage1b_records = None
+
+    if args.run_stage in ("all", "stage2"):
+        if stage1b_records is None:
+            stage1b_records = read_jsonl(args.stage1b_jsonl, STAGE1B_SCHEMA)
+            if args.num_videos > 0:
+                stage1b_records = stage1b_records[:args.num_videos]
         tracker = SAM2VideoTracker(
             args.sam2_config, args.sam2_checkpoint, args.sam2_device,
             args.sam2_amp_dtype, args.sam2_vos_optimized)
-
-    raw_path = args.out + ".raw.jsonl"
-    n_lines = 0
-    with open(args.out, "w", encoding="utf-8") as fout, \
-            open(raw_path, "w", encoding="utf-8") as raw_log:
-        for vi, (vid, target_ratio) in enumerate(index, 1):
-            video_path = os.path.join(args.video_dir, vid + ".mp4")
-            if not os.path.exists(video_path):
-                print("  [skip] no video: %s" % video_path)
-                fout.write(json.dumps(
-                    {"video_id": vid, "targetRatioWH": [int(target_ratio[0]),
-                     int(target_ratio[1])], "predictions": []},
-                    ensure_ascii=False) + "\n")
-                continue
-            n_frames, fps, W, H = video_meta(video_path)
-            cw, ch = compute_crop_size(W, H, target_ratio[0], target_ratio[1])
-
-            # Stage 1: highlight localization (model only).
-            segs_sec, raw = model.detect_highlights(
-                video_path, fps_sample=args.detect_fps,
-                max_new_tokens=args.max_new_tokens)
-            raw_log.write(json.dumps(
-                {"video_id": vid, "stage": "detect", "raw": raw},
-                ensure_ascii=False) + "\n")
-            segments = merge_segments(
-                sec_segments_to_frames(segs_sec, fps, n_frames),
-                n_frames
-            )
-
-            print("  [%d/%d] %s %dx%d fps=%.2f frames=%d crop=%dx%d segs=%s"
-                  % (vi, len(index), vid, W, H, fps, n_frames, cw, ch, segments))
-
-            # Stage 2: per-frame re-framing inside each segment.
-            predictions = []
-            for seg in segments:
-                if args.stage2_backend == "sam2":
-                    predictions.extend(track_segment(
-                        model, tracker, video_path, seg, target_ratio,
-                        W, H, raw_log, vid, args, cw, ch))
-                else:
-                    predictions.extend(_linear_fallback_predictions(
-                        model, video_path, seg, target_ratio,
-                        args.crop_stride, W, H, cw, ch, raw_log, vid))
-            predictions.sort(key=lambda r: r["frame"])
-            rec = {"video_id": vid,
-                   "targetRatioWH": [int(target_ratio[0]), int(target_ratio[1])],
-                   "predictions": predictions}
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            n_lines += len(predictions)
-            fout.flush()
-            raw_log.flush()
-    print("Done: %d videos / %d frame predictions -> %s"
-          % (len(index), n_lines, args.out))
-    print("Raw model outputs -> %s" % raw_path)
+        run_stage2(stage1b_records, args, tracker)
 
 
 if __name__ == "__main__":

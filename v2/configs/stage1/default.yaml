@@ -1,0 +1,36 @@
+{
+  "schema_version": "stage1.v1",
+  "video_extensions": [".mp4", ".mov", ".mkv", ".avi", ".webm"],
+  "ffmpeg_bin": "ffmpeg",
+  "ffprobe_bin": "ffprobe",
+  "compute_sha256": true,
+  "sampling": {
+    "fps": 2.0,
+    "max_side": 960,
+    "jpeg_quality": 90
+  },
+  "scene_detection": {
+    "enabled": true,
+    "backend": "opencv",
+    "content_threshold": 27.0,
+    "min_scene_length_sec": 1.5,
+    "detect_fades": true,
+    "fade_threshold": 12.0,
+    "frame_skip": 0,
+    "show_progress": false
+  },
+  "segments": {
+    "window_sec": 24.0,
+    "overlap_ratio": 0.25,
+    "boundary_snap_sec": 2.0,
+    "min_window_sec": 6.0
+  },
+  "audio": {
+    "enabled": true,
+    "sample_rate": 16000,
+    "bin_sec": 0.5,
+    "event_z_threshold": 2.5,
+    "onset_db_threshold": 6.0,
+    "asr_enabled": false
+  }
+}

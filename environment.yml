@@ -6,5 +6,6 @@ dependencies:
   - python=3.12
   - openai
   - pillow
+  - numpy
 prefix: /home/putik-ubuntu/.conda/envs/video-clip
 # 对于opencv需要使用pip安装，命令: pip install opencv-python=5.0
