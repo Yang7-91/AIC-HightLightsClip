@@ -10,3 +10,4 @@ dependencies:
   - pip:
       - scenedetect==0.7.1
       - PyYAML==6.0.3
+      - openai==3.8.0

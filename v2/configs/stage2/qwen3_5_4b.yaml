@@ -1,1 +1,74 @@
-# Stage 2 Qwen3.5-4B 粗高光候选配置占位。
+schema_version: stage2.v1
+
+api:
+  base_url: "http://172.25.254.120:8000/v1"
+  api_key: "EMPTY"
+  model: "QuantTrio/Qwen3.5-4B-AWQ"
+  timeout_sec: 300.0
+  max_retries: 2
+  healthcheck_on_start: true
+
+generation:
+  temperature: 0.0
+  top_p: 0.9
+  max_tokens: 4096
+  response_format:
+    type: json_object
+  extra_body:
+    chat_template_kwargs:
+      # Stage 2 需要短小、严格的结构化 JSON。开启思考模式可能先耗尽
+      # max_tokens，导致最终 content 为空或 JSON 被截断。
+      enable_thinking: true
+    thinking_token_budget: 1024
+    mm_processor_kwargs:
+      fps: 2.0
+      do_sample_frames: true
+
+video_input:
+  # url: 仅把可由 vLLM/WSL 访问的 URL 传给服务端，不在客户端编码。
+  # data_url: 将 Stage 1 的低帧率 JPEG 序列编码为 MP4 Base64 data URL。
+  mode: data_url
+  url_template: ""
+  include_time_range_fields: false
+  allowed_url_schemes: [http, https, file]
+  fps: 2.0
+  ffmpeg_bin: ffmpeg
+  codec: libx264
+  preset: veryfast
+  crf: 28
+  pixel_format: yuv420p
+  max_payload_mib: 64.0
+  keep_encoded_video: false
+
+context:
+  max_frames: 64
+  max_audio_bins: 64
+  max_audio_events: 24
+  max_asr_segments: 32
+  audio_event_min_score: 0.25
+
+parsing:
+  retries: 1
+  clamp_out_of_range_times: true
+
+scoring:
+  weights:
+    semantic: 0.6
+    event: 0.4
+    audio: 0.0
+    quality: 0.0
+    stability: 0.0
+  neutral_quality_score: 0.0
+  neutral_stability_score: 0.0
+  min_candidate_score: 0.44
+
+merging:
+  expand_before_sec: 0.0
+  expand_after_sec: 0.0
+  max_merge_gap_sec: 0.0
+  min_duration_sec: 0.5
+
+runtime:
+  backend: openai
+  persist_request_descriptors: true
+  persist_raw_responses: true
