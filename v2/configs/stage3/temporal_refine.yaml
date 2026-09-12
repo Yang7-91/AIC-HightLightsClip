@@ -1,4 +1,4 @@
-schema_version: stage3.v1
+schema_version: stage3.v2
 
 runtime:
   # refine: 正常执行高帧率解码和边界细化；passthrough: 完全跳过处理。

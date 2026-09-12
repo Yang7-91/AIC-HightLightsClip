@@ -16,7 +16,6 @@ from .segment_loader import LoadedSegment
 #     "end_offset_sec": "number or null",
 #     "category": "string or null",
 #     "subject": "string or null",
-#     "subject_point": "[normalized_x, normalized_y] or null",
 #     "reason": "short string",
 #     "evidence_sample_ids": "integer array using sample_id values from the frame timeline",
 # }

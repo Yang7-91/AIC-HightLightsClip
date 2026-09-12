@@ -17,7 +17,10 @@
 
 每个视频先写入 ``videos/.<video_id>.inprogress``。只有区间校验、JSONL 写入
 和产物完整性校验全部成功，才写 ``_SUCCESS.json`` 并将临时目录重命名为
-正式目录。这可以防止 Stage 4 读取到只完成一部分的 Stage 3 结果。
+正式目录。这可以防止下游读取到只完成一部分的 Stage 3 结果。
+
+Stage 3 只细化时间边界并透传主体文本，不生成也不透传 ``subject_point``。
+空间点提示由后续 Stage 3.5 在最终高光区间内生成。
 """
 
 from __future__ import annotations
@@ -55,9 +58,10 @@ def _base_interval(candidate: dict[str, Any], mapped: dict[str, Any], mode: str)
     """组装所有执行路径共用的 Stage 3 区间字段。
 
     ``mapped`` 必须已经包含合法的 ``start/end_sec`` 和半开帧区间
-    ``[start_frame, end_frame)``。本函数保留 Stage 2 的分数、类别和主体提示，
-    使 Stage 4 无需回读 Stage 2；与细化有关的分数先填安全默认值，正常模式
-    会在时序推理完成后覆盖。
+    ``[start_frame, end_frame)``。本函数保留 Stage 2 的分数、类别和主体文本，
+    供后续 Stage 3.5 做空间定位；与细化有关的分数先填安全默认值，正常模式
+    会在时序推理完成后覆盖。即使输入是旧 Stage 2 产物，也不会透传其中的
+    ``subject_point``。
     """
 
     return {
@@ -78,10 +82,10 @@ def _base_interval(candidate: dict[str, Any], mapped: dict[str, Any], mode: str)
         "coarse_score": float(candidate.get("coarse_score", 0.0)),
         "temporal_score": float(candidate.get("coarse_score", 0.0)),
         "boundary_confidence": 0.0,
-        # 语义与主体信息透传给 Stage 4，用于选择需要跟踪和构图的对象。
+        # 只透传主体文本等语义信息，供 Stage 3.5 选择需要定位的对象。
+        # subject_point 明确不属于 Stage 3 输出契约。
         "source_segment_ids": [int(value) for value in candidate.get("source_segment_ids", [])],
         "subject": candidate.get("subject"),
-        "subject_point": candidate.get("subject_point"),
         "category": candidate.get("category"),
         "reason": str(candidate.get("reason", "")),
     }

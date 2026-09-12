@@ -27,7 +27,6 @@ class SegmentAnalysis(SerializableRecord):
     start_sec: float | None
     end_sec: float | None
     subject: str | None
-    subject_point: list[float] | None
     category: str | None
     reason: str
     evidence_sample_ids: list[int]
@@ -48,7 +47,6 @@ class HighlightCandidate(SerializableRecord):
     stability_score: float
     source_segment_ids: list[int]
     subject: str | None
-    subject_point: list[float] | None
     category: str | None
     reason: str
 
@@ -59,5 +57,4 @@ class SubjectHint(SerializableRecord):
     video_id: str
     candidate_id: str
     subject: str | None
-    subject_point: list[float] | None
     source_segment_ids: list[int]

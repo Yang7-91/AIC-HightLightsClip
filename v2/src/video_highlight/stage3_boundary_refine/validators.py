@@ -68,6 +68,8 @@ def validate_intervals(intervals: list[dict[str, Any]], metadata: dict[str, Any]
     seen: set[str] = set()
     previous_end = -1
     for row in intervals:
+        if "subject_point" in row:
+            raise ArtifactValidationError("Stage 3 refined interval 禁止包含 subject_point")
         interval_id = str(row["interval_id"])
         if interval_id in seen:
             raise ArtifactValidationError(f"重复 interval_id: {interval_id}")

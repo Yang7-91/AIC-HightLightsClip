@@ -75,7 +75,6 @@ class CandidateMergerTests(unittest.TestCase):
             "stability_score": 0.5,
             "source_segment_ids": [0],
             "subject": "a",
-            "subject_point": [0.5, 0.5],
             "category": "x",
             "reason": "r",
         }
@@ -129,10 +128,13 @@ class MockPipelineTests(unittest.TestCase):
             prompts = {"system_prompt": "system", "user_template": "{video_id} {segment_id} {segment_start_sec} {segment_end_sec} {segment_duration_sec} {visual_fps} {frame_timeline} {audio_events} {audio_timeline} {asr_timeline}"}
             summary = run_stage2(root / "stage1", root / "stage2", config, prompts, strict=True)
             candidates = [json.loads(line) for line in (root / "stage2/videos/0/candidates.jsonl").read_text(encoding="utf-8").splitlines()]
+            subject_hints = [json.loads(line) for line in (root / "stage2/videos/0/subject_hints.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual(len(candidates), 2)
             self.assertEqual(candidates[0]["start_sec"], 1.0)
             self.assertEqual(candidates[1]["start_sec"], 3.5)
+            self.assertTrue(all("subject_point" not in row for row in candidates))
+            self.assertTrue(all("subject_point" not in row for row in subject_hints))
 
 
 if __name__ == "__main__":

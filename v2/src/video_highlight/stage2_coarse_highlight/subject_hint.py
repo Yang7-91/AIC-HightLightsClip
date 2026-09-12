@@ -1,4 +1,4 @@
-"""从最终粗候选生成 Stage 4 可消费的主体提示。"""
+"""从最终粗候选生成纯语义主体提示，供后续 Stage 3.5 定位主体。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ def build_subject_hints(candidates: list[dict[str, Any]]) -> list[dict[str, Any]
             "video_id": candidate["video_id"],
             "candidate_id": candidate["candidate_id"],
             "subject": candidate.get("subject"),
-            "subject_point": candidate.get("subject_point"),
             "source_segment_ids": candidate["source_segment_ids"],
         }
         for candidate in candidates

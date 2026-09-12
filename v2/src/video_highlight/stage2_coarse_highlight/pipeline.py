@@ -11,7 +11,10 @@
 4. 调用 Qwen3.5-4B，并将原始响应保存为可追踪记录；
 5. 把模型返回的相对片段时间转换成原视频绝对时间；
 6. 融合语义、事件、音频、质量和稳定性分数；
-7. 合并来自重叠窗口的候选，并生成 Stage 3/4 可消费的结果。
+7. 合并来自重叠窗口的候选，并生成 Stage 3 可消费的时间与语义结果。
+
+Stage 2 只负责“何时高光”和“高光主体是什么”的粗语义判断，不输出空间坐标
+``subject_point``。主体点将在后续 Stage 3.5 中基于精确高光区间单独生成。
 
 Stage 2 采用两级持久化：每完成一个片段就更新视频临时目录中的 JSONL，
 每完成一个视频再写入 ``_SUCCESS.json`` 并把 ``.<video_id>.inprogress``
@@ -52,6 +55,22 @@ def _load_existing(path: Path) -> list[dict[str, Any]]:
     ``_SUCCESS.json`` 判断，不能仅根据某个 JSONL 是否存在来推断成功。
     """
     return read_jsonl(path) if path.is_file() else []
+
+
+def _drop_deprecated_subject_points(analyses: list[dict[str, Any]]) -> None:
+    """原地清理恢复目录中旧版 Stage 2 结构化结果的空间点字段。
+
+    新响应解析器不会产生该字段；此兼容逻辑只避免 ``--resume`` 把历史
+    ``analyses_segment_results.jsonl`` 中的旧字段再次写入 stage2.v2 产物。
+    """
+
+    for analysis in analyses:
+        analysis.pop("subject_point", None)
+        candidates = analysis.get("candidates", [])
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    candidate.pop("subject_point", None)
 
 
 def _redacted_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +215,8 @@ def process_video(
     requests = _load_existing(work_dir / "requests.jsonl") if resume else []
     raw_responses = _load_existing(work_dir / "raw_responses.jsonl") if resume else []
     analyses = _load_existing(work_dir / "analyses_segment_results.jsonl") if resume else []
+    # 恢复运行允许读取旧临时结果，但后续落盘前必须升级为不含空间点的 v2 契约。
+    _drop_deprecated_subject_points(analyses)
     # segment_results 是判断某个片段是否已完成的唯一依据。
     completed_ids = {int(row["segment_id"]) for row in analyses}
     # 加载 Stage 1 的 metadata、segments、sample_map、音频事件和 ASR 文件。
@@ -254,7 +275,8 @@ def process_video(
             float(video.metadata["duration_sec"]),
             config.get("merging", {}),
         )
-        # subject_hints 是 Stage 4 的稳定接口，不要求 Stage 4 读取模型原始响应。
+        # subject_hints 只保留主体文本与来源，不包含不可靠的粗采样空间坐标；
+        # 后续 Stage 3.5 可用这些语义提示在精确区间内生成 subject_point。
         subject_hints = build_subject_hints(candidates)
         # 即使没有高光，也必须写出合法的空 candidates.jsonl 和 subject_hints.jsonl。
         write_jsonl(work_dir / "requests.jsonl", requests)

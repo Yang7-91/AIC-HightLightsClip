@@ -141,6 +141,9 @@ subject_hints.jsonl
 _SUCCESS.json
 ```
 
+Stage 2 只输出主体文本 `subject`，不输出 `subject_point`。低帧率粗采样上的
+点定位误差较大，空间点提示将由后续 Stage 3.5 在帧级高光区间确定后单独生成。
+
 响应中的相对时间由确定性代码映射为原视频绝对时间，重叠窗口候选会扩展、
 合并并生成稳定的 `candidate_id`。Base64 本体不会写入请求日志。
 
@@ -183,6 +186,9 @@ refined_intervals.jsonl
 diagnostics.jsonl
 _SUCCESS.json
 ```
+
+Stage 3 只负责时间边界和主体语义透传，`refined_intervals.jsonl` 不包含
+`subject_point`；即使读取旧版 Stage 2 产物中的同名字段也会主动丢弃。
 
 未来获得训练好的 TorchScript TCN 权重后，可用 `--backend tcn --checkpoint ...`
 切换到模型推理；默认规则后端不依赖 PyTorch，也不包含训练代码。
