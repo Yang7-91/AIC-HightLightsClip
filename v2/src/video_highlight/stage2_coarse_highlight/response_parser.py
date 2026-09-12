@@ -197,10 +197,11 @@ def parse_response(text: str, segment: LoadedSegment, config: dict[str, Any]) ->
     candidate_payloads = payload.get("candidates")
     if not isinstance(candidate_payloads, list):
         raise ResponseParseError("candidates 不是数组")
-    if has_highlight != bool(candidate_payloads):
-        raise ResponseParseError(
-            "has_highlight 必须与 candidates 是否非空保持一致"
-        )
+    # 降低严格要求，不再非空保持一致
+    # if has_highlight != bool(candidate_payloads):
+    #     raise ResponseParseError(
+    #         "has_highlight 必须与 candidates 是否非空保持一致,has_highlight:{},candidates:{}".format(has_highlight, candidate_payloads)
+    #     )
 
     clamp = bool(config.get("clamp_out_of_range_times", True))
     candidates = [

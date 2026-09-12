@@ -58,7 +58,7 @@ def build_candidate(
         "stability_score": stability,
         "source_segment_ids": [segment.segment_id],
         "subject": analysis.get("subject"),
-        "subject_point": analysis.get("subject_point"),
+        "subject_point": analysis.get("subject_point"), # TODO 目前已经取消stage2的定位框1输出，因为误差过大没有意义，但是相关代码还没有剔除
         "category": analysis.get("category"),
         "reason": analysis.get("reason", ""),
     }
