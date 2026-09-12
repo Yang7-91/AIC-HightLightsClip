@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "video-highlight"
 version = "0.1.0"
-description = "Five-stage video highlight inference pipeline"
+description = "Video highlight inference pipeline with a Stage 3.5 subject-point bridge"
 requires-python = ">=3.12"
 dependencies = [
   "numpy>=2.0",

@@ -1,4 +1,4 @@
-"""根据 Stage 3 点提示或中心偏置视觉显著性初始化主体框。"""
+"""根据 Stage 3.5 点提示或中心偏置视觉显著性初始化主体框。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def select_subject_box(
     box_h = height * float(config.get("initial_height_ratio", 0.38))
     if point is not None:
         center_x, center_y = point[0] * width, point[1] * height
-        return _clamp_box((center_x - box_w / 2, center_y - box_h / 2, center_x + box_w / 2, center_y + box_h / 2), width, height), 0.85, "stage3_point"
+        return _clamp_box((center_x - box_w / 2, center_y - box_h / 2, center_x + box_w / 2, center_y + box_h / 2), width, height), 0.85, "stage3_5_point"
 
     max_side = int(config.get("saliency_max_side", 320))
     scale = min(1.0, max_side / max(height, width))

@@ -1,4 +1,4 @@
-"""Stage 4 配置、Stage 1/3 输入和逐帧构图输出校验。"""
+"""Stage 4 配置、Stage 1/3.5 输入和逐帧构图输出校验。"""
 
 from __future__ import annotations
 
@@ -20,34 +20,57 @@ def _read_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def list_stage3_video_ids(stage3_dir: str | Path) -> list[str]:
-    videos = Path(stage3_dir).resolve() / "videos"
+def list_stage3_5_video_ids(stage3_5_dir: str | Path) -> list[str]:
+    videos = Path(stage3_5_dir).resolve() / "videos"
     if not videos.is_dir():
-        raise ArtifactValidationError(f"Stage 3 videos 目录不存在: {videos}")
+        raise ArtifactValidationError(f"Stage 3.5 videos 目录不存在: {videos}")
     return sorted(row.name for row in videos.iterdir() if row.is_dir() and not row.name.startswith(".") and (row / "_SUCCESS.json").is_file())
 
 
 def load_video_inputs(
-    stage1_dir: str | Path, stage3_dir: str | Path, video_id: str
+    stage1_dir: str | Path, stage3_5_dir: str | Path, video_id: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     stage1_video = Path(stage1_dir).resolve() / "videos" / video_id
-    stage3_video = Path(stage3_dir).resolve() / "videos" / video_id
+    stage3_5_video = Path(stage3_5_dir).resolve() / "videos" / video_id
     if not (stage1_video / "_SUCCESS.json").is_file():
         raise ArtifactValidationError(f"Stage 1 视频没有成功标记: {stage1_video}")
-    if not (stage3_video / "_SUCCESS.json").is_file():
-        raise ArtifactValidationError(f"Stage 3 视频没有成功标记: {stage3_video}")
+    if not (stage3_5_video / "_SUCCESS.json").is_file():
+        raise ArtifactValidationError(f"Stage 3.5 视频没有成功标记: {stage3_5_video}")
     metadata = _read_object(stage1_video / "metadata.json")
     scenes = read_jsonl(stage1_video / "scenes.jsonl")
-    intervals = read_jsonl(stage3_video / "refined_intervals.jsonl")
+    intervals = read_jsonl(stage3_5_video / "enriched_intervals.jsonl")
+    point_rows = read_jsonl(stage3_5_video / "subject_points.jsonl")
+    points_by_interval: dict[str, list[dict[str, Any]]] = {}
+    for point in point_rows:
+        interval_id = str(point.get("interval_id", ""))
+        if str(point.get("video_id")) != video_id:
+            raise ArtifactValidationError(f"Stage 3.5 主体点 video_id 不一致: {interval_id}")
+        value = point.get("subject_point")
+        if value is not None and (not isinstance(value, list) or len(value) != 2 or not all(0.0 <= float(axis) <= 1.0 for axis in value)):
+            raise ArtifactValidationError(f"Stage 3.5 主体点非法: {interval_id}/{point.get('frame')}")
+        points_by_interval.setdefault(interval_id, []).append(point)
     frame_count = int(metadata["frame_count"])
     previous_end = -1
     for interval in intervals:
         start, end = int(interval["start_frame"]), int(interval["end_frame"])
         if str(interval.get("video_id")) != video_id or not (0 <= start < end <= frame_count):
-            raise ArtifactValidationError(f"Stage 3 区间非法: {interval.get('interval_id')}")
+            raise ArtifactValidationError(f"Stage 3.5 区间非法: {interval.get('interval_id')}")
         if start < previous_end:
-            raise ArtifactValidationError("Stage 3 区间重叠或未排序")
+            raise ArtifactValidationError("Stage 3.5 区间重叠或未排序")
         previous_end = end
+        interval_id = str(interval["interval_id"])
+        interval["subject_points"] = sorted(points_by_interval.pop(interval_id, []), key=lambda row: int(row["frame"]))
+        expected_count = int(interval.get("subject_point_sample_count", len(interval["subject_points"])))
+        if len(interval["subject_points"]) != expected_count:
+            raise ArtifactValidationError(f"Stage 3.5 主体点数量与区间摘要不一致: {interval_id}")
+        sample_indices = [int(point["sample_index"]) for point in interval["subject_points"]]
+        if sample_indices != list(range(len(sample_indices))):
+            raise ArtifactValidationError(f"Stage 3.5 sample_index 不连续或顺序异常: {interval_id}")
+        for point in interval["subject_points"]:
+            if not start <= int(point["frame"]) < end:
+                raise ArtifactValidationError(f"Stage 3.5 主体点不属于区间: {interval_id}/{point['frame']}")
+    if points_by_interval:
+        raise ArtifactValidationError(f"Stage 3.5 主体点引用未知区间: {sorted(points_by_interval)}")
     return metadata, scenes, intervals
 
 

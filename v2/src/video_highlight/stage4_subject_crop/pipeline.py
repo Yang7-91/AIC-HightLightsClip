@@ -3,12 +3,12 @@
 本模块负责把前序阶段的“高光时间区间”转换成比赛所需的逐帧构图框。数据依赖被
 刻意限制为以下两类，Stage 4 不读取 Stage 2：
 
-1. Stage 3 ``refined_intervals.jsonl``：高光的左闭右开帧区间，以及主体描述、
-   可选主体点等已经随候选向后传递的语义信息；
+1. Stage 3.5 ``enriched_intervals.jsonl`` 和 ``subject_points.jsonl``：高光的
+   左闭右开帧区间、主体描述，以及默认 2 FPS 的逐采样帧归一化主体中心；
 2. Stage 1 ``metadata.json`` 和 ``scenes.jsonl``：只有源视频路径、画面尺寸、
    ``targetRatioWH``、总帧数和镜头边界等空间处理不可替代的信息。
 
-对每个 Stage 3 区间，处理链路为：
+对每个 Stage 3.5 区间，处理链路为：
 
 ``主体逐帧跟踪 -> 按镜头切分 -> 构图候选生成 -> 构图代价计算``
 ``-> 动态规划选路 -> 时序平滑 -> 整数化与边界校验 -> 持久化``
@@ -39,7 +39,7 @@ from .crop_candidates import generate_crop_candidates
 from .subject_tracker import CenterSubjectTracker, SubjectTracker, TrackPoint, build_subject_tracker
 from .trajectory_optimizer import optimize_trajectory
 from .trajectory_smoother import smooth_trajectory
-from .validators import list_stage3_video_ids, load_video_inputs, validate_config, validate_crops, validate_stage4_artifacts
+from .validators import list_stage3_5_video_ids, load_video_inputs, validate_config, validate_crops, validate_stage4_artifacts
 
 
 def _frame_size(metadata: dict[str, Any]) -> tuple[int, int]:
@@ -96,7 +96,7 @@ def _plan_interval(
     Parameters
     ----------
     interval:
-        Stage 3 区间或由 :func:`_plan_across_scenes` 派生出的镜头子区间。帧范围采用
+        Stage 3.5 区间或由 :func:`_plan_across_scenes` 派生出的镜头子区间。帧范围采用
         ``[start_frame, end_frame)`` 左闭右开语义。
     points:
         跟踪器输出的逐帧主体框，必须与区间中的每一帧严格一一对应。
@@ -167,7 +167,7 @@ def _plan_interval(
 def _planning_spans(interval: dict[str, Any], scenes: list[dict[str, Any]]) -> list[tuple[int, int]]:
     """按 Stage 1 镜头边界切开区间，返回若干左闭右开的规划子区间。
 
-    一个 Stage 3 高光区间可能覆盖多个镜头。硬切前后的主体位置通常没有连续关系，
+    一个 Stage 3.5 高光区间可能覆盖多个镜头。硬切前后的主体位置通常没有连续关系，
     若放在同一次动态规划和平滑中处理，会把前一镜头的构图惯性错误带入后一镜头。
     因此仅把严格落在高光内部的 ``scene.start_frame`` 作为切点；区间端点无需重复。
     """
@@ -193,7 +193,7 @@ def _plan_across_scenes(
     target_ratio: tuple[float, float],
     config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-    """逐镜头独立规划构图，再按原始帧顺序拼回一个 Stage 3 区间。
+    """逐镜头独立规划构图，再按原始帧顺序拼回一个 Stage 3.5 区间。
 
     跟踪器返回的 ``points`` 是相对整个高光区间的连续列表，而镜头边界是原视频绝对
     帧号。因此切片前先减去 ``interval_start`` 转为列表下标。子区间只临时覆盖起止帧，
@@ -238,7 +238,7 @@ def _center_points(interval: dict[str, Any], frame_size: tuple[int, int], tracki
 
 def process_video(
     stage1_dir: Path,
-    stage3_dir: Path,
+    stage3_5_dir: Path,
     video_id: str,
     videos_output_dir: Path,
     tracker: SubjectTracker,
@@ -274,9 +274,9 @@ def process_video(
 
     # load_video_inputs 是 Stage 4 唯一的上游读取入口：
     # - Stage 1：metadata.json、scenes.jsonl；
-    # - Stage 3：refined_intervals.jsonl；
-    # 这里没有 Stage 2 路径，避免 Stage 4 绕过 Stage 3 的最终边界契约。
-    metadata, scenes, intervals = load_video_inputs(stage1_dir, stage3_dir, video_id)
+    # - Stage 3.5：enriched_intervals.jsonl、subject_points.jsonl。
+    # Stage 4 不接收 Stage 3 路径；时间、语义和空间提示均以 Stage 3.5 为唯一契约。
+    metadata, scenes, intervals = load_video_inputs(stage1_dir, stage3_5_dir, video_id)
     frame_size = _frame_size(metadata)
     target_ratio = _target_ratio(metadata)
     # 源视频不复制到项目中，直接使用 Stage 1 已持久化的绝对 source_path。
@@ -316,13 +316,13 @@ def process_video(
                 # 保存异常类型和消息但不中断本视频，方便后续统计哪些区间曾经降级。
                 diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
 
-            # 每个 Stage 3 区间不会与其他区间重叠；此处先累积，循环结束后统一排序校验。
+            # 每个 Stage 3.5 区间不会与其他区间重叠；先累积，循环结束后统一排序校验。
             crops.extend(interval_crops)
             tracks.extend(interval_tracks)
             if status == "tracked":
                 # 平均置信度和镜头子段数量是区间级诊断值，不参与最终比赛输出。
                 diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval["interval_id"], "status": status, "frame_count": len(interval_crops), "planning_span_count": planning_span_count, "mean_track_confidence": sum(point.confidence for point in points) / max(1, len(points))})
-        # Stage 3 保证区间不重叠；这里仍按帧排序并显式拒绝任何重复帧。
+        # Stage 3.5 保证区间不重叠；这里仍按帧排序并显式拒绝任何重复帧。
         crops.sort(key=lambda row: int(row["frame"]))
         tracks.sort(key=lambda row: int(row["frame"]))
         # validate_crops 检查帧范围、严格升序、数值有限性、目标比例换算和画面边界。
@@ -346,7 +346,7 @@ def process_video(
 
 def run_stage4(
     stage1_dir: str | Path,
-    stage3_dir: str | Path,
+    stage3_5_dir: str | Path,
     output_dir: str | Path,
     config: dict[str, Any],
     video_ids: set[str] | None = None,
@@ -360,14 +360,14 @@ def run_stage4(
 
     Parameters
     ----------
-    stage1_dir, stage3_dir:
-        同一数据批次的 Stage 1 与 Stage 3 输出根目录。Stage 2 不属于本函数契约。
+    stage1_dir, stage3_5_dir:
+        同一数据批次的 Stage 1 与 Stage 3.5 输出根目录。Stage 3 不属于本函数契约。
     output_dir:
         本次 Stage 4 运行目录，其中每个视频写入 ``videos/<video_id>``。
     config:
         已加载的 Stage 4 配置映射。
     video_ids:
-        可选视频 ID 白名单；``None`` 表示处理 Stage 3 中全部成功视频。
+        可选视频 ID 白名单；``None`` 表示处理 Stage 3.5 中全部成功视频。
     limit:
         在 ID 筛选后最多处理多少个视频，便于冒烟测试。
     resume:
@@ -387,24 +387,24 @@ def run_stage4(
 
     # 在创建任何结果之前校验配置结构，尽早暴露配置字段缺失或错误枚举值。
     validate_config(config)
-    stage1_root, stage3_root, stage4_root = Path(stage1_dir).resolve(), Path(stage3_dir).resolve(), Path(output_dir).resolve()
+    stage1_root, stage3_5_root, stage4_root = Path(stage1_dir).resolve(), Path(stage3_5_dir).resolve(), Path(output_dir).resolve()
     videos_output = stage4_root / "videos"
     videos_output.mkdir(parents=True, exist_ok=True)
 
-    # Stage 3 是高光区间的权威来源，所以任务列表也从 Stage 3 成功目录枚举；Stage 1
+    # Stage 3.5 是高光区间和主体点的权威来源，所以任务列表从其成功目录枚举；Stage 1
     # 缺失会在处理对应视频时由 load_video_inputs 给出明确错误。
-    available = list_stage3_video_ids(stage3_root)
+    available = list_stage3_5_video_ids(stage3_5_root)
     selected = [video_id for video_id in available if not video_ids or video_id in video_ids]
     # limit 在 video_ids 过滤后应用，使 --video-id 与 --limit 组合时含义稳定。
     if limit is not None:
         selected = selected[:limit]
     if not selected:
-        raise ArtifactValidationError("筛选后没有可处理的 Stage 3 视频")
+        raise ArtifactValidationError("筛选后没有可处理的 Stage 3.5 视频")
 
     # 跟踪器通常包含模型或后端状态，整批只构造一次，避免逐视频重复加载 SAM2 权重。
     tracker = build_subject_tracker(config["tracking"])
     # 配置哈希与解析后的配置一起持久化，便于确认不同实验是否真正使用同一参数。
-    run_info = {"schema_version": STAGE4_SCHEMA_VERSION, "started_at": utc_now_iso(), "stage1_dir": str(stage1_root), "stage3_dir": str(stage3_root), "tracking_backend": config["tracking"].get("backend", "opencv"), "config_sha256": mapping_sha256(config), "selected_video_count": len(selected)}
+    run_info = {"schema_version": STAGE4_SCHEMA_VERSION, "started_at": utc_now_iso(), "stage1_dir": str(stage1_root), "stage3_5_dir": str(stage3_5_root), "tracking_backend": config["tracking"].get("backend", "opencv"), "config_sha256": mapping_sha256(config), "selected_video_count": len(selected)}
     write_json(stage4_root / "resolved_config.json", deepcopy(config))
     write_json(stage4_root / "run_manifest.json", run_info)
     manifest: list[dict[str, Any]] = []
@@ -413,7 +413,7 @@ def run_stage4(
         if logger:
             logger.info("[%d/%d] Stage 4 处理 video_id=%s", position, len(selected), video_id)
         try:
-            record = process_video(stage1_root, stage3_root, video_id, videos_output, tracker, config, resume, overwrite)
+            record = process_video(stage1_root, stage3_5_root, video_id, videos_output, tracker, config, resume, overwrite)
         except Exception as error:
             # 非 strict 模式把异常转为结构化记录并继续下一视频；traceback 单独保留，
             # 既方便自动汇总，也能在无需复现的情况下定位具体代码路径。

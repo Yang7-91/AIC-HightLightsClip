@@ -16,7 +16,7 @@ from .pipeline import run_stage4
 def build_parser(project_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage 4：主体跟踪、构图框生成和轨迹平滑")
     parser.add_argument("--stage1-dir", type=Path, required=True, help="同批次 Stage 1 输出目录")
-    parser.add_argument("--stage3-dir", type=Path, required=True, help="Stage 3 输出目录；不需要 Stage 2 路径")
+    parser.add_argument("--stage3-5-dir", type=Path, required=True, help="Stage 3.5 输出目录；Stage 4 不再读取 Stage 3")
     parser.add_argument("--paths-config", type=Path, default=project_root / "configs/paths.yaml")
     parser.add_argument("--config", type=Path, default=project_root / "configs/stage4/sam2_crop.yaml")
     parser.add_argument("--output-dir", type=Path)
@@ -49,7 +49,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger = configure_logging(Path(output_dir) / "stage4.log", verbose=args.verbose)
     summary = run_stage4(
         args.stage1_dir,
-        args.stage3_dir,
+        args.stage3_5_dir,
         output_dir,
         config,
         video_ids=set(args.video_ids) if args.video_ids else None,

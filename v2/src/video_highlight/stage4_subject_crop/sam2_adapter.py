@@ -61,7 +61,7 @@ class SAM2SubjectTracker:
                     capture.release()
                     raise RuntimeError("SAM2 临时帧写入失败")
             capture.release()
-            anchor, _, _ = select_subject_box(first, subject_point(interval), self.config)
+            anchor, _, _ = select_subject_box(first, subject_point(interval, start), self.config)
             state = self.predictor.init_state(video_path=directory)
             results: dict[int, TrackPoint] = {}
             with self._contexts():

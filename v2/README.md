@@ -1,6 +1,6 @@
 # Video Highlight Pipeline V2
 
-五阶段视频高光剪辑推理工程。目前已完成 Stage 1 至 Stage 5：
+视频高光剪辑推理工程。目前已完成 Stage 1、2、3、3.5、4、5：
 
 - FFprobe 读取视频流、音频流、FPS、时间基、尺寸、旋转和时长；
 - PySceneDetect `ContentDetector` 完成硬切镜头检测，可选 `ThresholdDetector` 检测渐变；
@@ -190,17 +190,47 @@ _SUCCESS.json
 Stage 3 只负责时间边界和主体语义透传，`refined_intervals.jsonl` 不包含
 `subject_point`；即使读取旧版 Stage 2 产物中的同名字段也会主动丢弃。
 
+## Stage 3.5：逐采样帧主体中心定位
+
+Stage 3.5 读取 Stage 3 最终高光区间，并只从 Stage 1 读取源视频路径、FPS 和
+总帧数。它不会复用 Stage 1 的粗采样帧，而是在每个 `[start_frame,end_frame)`
+内默认按 2 FPS 即时解码原视频，将全部采样 JPEG 和明确的原始帧号/时间戳顺序
+一次性发送给 Qwen。模型返回各 `sample_index` 的归一化 `[x,y]` 主体中心。
+
+```powershell
+python scripts/run_stage3_5.py `
+  --stage1-dir runs/full/stage1 `
+  --stage3-dir runs/full/stage3 `
+  --output-dir runs/full/stage3_5 `
+  --strict
+```
+
+跳过全部解码和模型调用、但生成相同采样时间轴和空点契约：
+
+```powershell
+python scripts/run_stage3_5.py `
+  --stage1-dir runs/full/stage1 `
+  --stage3-dir runs/full/stage3 `
+  --output-dir runs/full/stage3_5_passthrough `
+  --skip-processing `
+  --strict
+```
+
+每个视频输出 `enriched_intervals.jsonl`、`subject_points.jsonl`、
+`requests.jsonl`、`raw_responses.jsonl`、`diagnostics.jsonl` 和 `_SUCCESS.json`。
+请求日志只保存帧号时间线和 JPEG 总字节数，不保存 Base64 图像本体。
+
 未来获得训练好的 TorchScript TCN 权重后，可用 `--backend tcn --checkpoint ...`
 切换到模型推理；默认规则后端不依赖 PyTorch，也不包含训练代码。
 
 ## Stage 4：主体构图与轨迹优化
 
-Stage 4 以 Stage 3 的 `refined_intervals.jsonl` 作为高光区间、主体语义和主体点提示的
-唯一上游契约。它只从 Stage 1 读取源视频路径、原始帧率/尺寸、`targetRatioWH` 和镜头
-边界；命令行没有 Stage 2 参数，也不会读取 Stage 2 产物。
+Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_points.jsonl` 作为
+高光区间、主体语义和逐采样帧主体点的唯一上游契约。它只从 Stage 1 读取源视频
+路径、原始帧率/尺寸、`targetRatioWH` 和镜头边界；不会直接读取 Stage 2 或 Stage 3。
 
-默认使用不需要额外模型权重的 OpenCV 后端：在区间首帧或镜头切换处根据 Stage 3
-主体点初始化；没有主体点时使用中心偏置视觉显著性；随后通过稀疏光流逐帧传播主体框。
+默认使用不需要额外模型权重的 OpenCV 后端：在每个有效 Stage 3.5 采样点处重新
+校正主体框，采样点之间通过稀疏光流逐帧传播；没有可用点时使用中心偏置视觉显著性。
 每帧围绕主体生成多尺度、多偏移、运动方向留白的目标比例候选框，使用动态规划选择
 低代价轨迹，再对中心和尺度做限速平滑。镜头边界两侧分别优化，不跨硬切镜头平滑。
 所有框最后统一取整、再次限界，并输出比赛需要的 `[x, y, w]`。
@@ -210,7 +240,7 @@ Stage 4 以 Stage 3 的 `refined_intervals.jsonl` 作为高光区间、主体语
 ```powershell
 python scripts/run_stage4.py `
   --stage1-dir runs/full/stage1 `
-  --stage3-dir runs/full/stage3 `
+  --stage3-5-dir runs/full/stage3_5 `
   --output-dir runs/full/stage4 `
   --strict
 ```
@@ -270,6 +300,7 @@ python scripts/validate_submission.py `
 python -m unittest discover -s tests/stage1 -v
 python -m unittest discover -s tests/stage2 -v
 python -m unittest discover -s tests/stage3 -v
+python -m unittest discover -s tests/stage3_5 -v
 python -m unittest discover -s tests/stage4 -v
 python -m unittest discover -s tests/stage5 -v
 ```

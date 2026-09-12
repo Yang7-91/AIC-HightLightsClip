@@ -12,7 +12,7 @@ import numpy as np
 from video_highlight.common.exceptions import ArtifactValidationError, ConfigurationError
 
 from .keyframe_selector import reinitialization_frames
-from .prompt_generator import subject_point
+from .prompt_generator import subject_point, subject_point_frames
 from .subject_selector import select_subject_box
 from .track_monitor import track_is_valid
 
@@ -66,7 +66,8 @@ class OpenCVSubjectTracker:
             raise ArtifactValidationError(f"源视频不存在: {video_path}")
         start, end = int(interval["start_frame"]), int(interval["end_frame"])
         resets = reinitialization_frames(interval, scenes, int(self.config.get("reinitialize_every_frames", 0)))
-        point = subject_point(interval)
+        # 每个 Stage 3.5 有效采样点都是新的空间观测；在这些帧主动校正光流漂移。
+        resets.update(subject_point_frames(interval))
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
             raise ArtifactValidationError(f"OpenCV 无法打开视频: {video_path}")
@@ -83,6 +84,7 @@ class OpenCVSubjectTracker:
                     raise ArtifactValidationError(f"视频在 frame={frame_index} 提前结束")
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 if frame_index in resets or previous_gray is None or previous_box is None:
+                    point = subject_point(interval, frame_index)
                     box, confidence, source = select_subject_box(frame, point, self.config)
                     points = self._features(gray, box, maximum_points)
                 else:
@@ -106,6 +108,7 @@ class OpenCVSubjectTracker:
                                 confidence = float(len(new) / max(len(previous_points), 1))
                                 points = new.reshape(-1, 1, 2).astype(np.float32)
                     if not track_is_valid(previous_box, box, frame_size, confidence, self.config):
+                        point = subject_point(interval, frame_index)
                         box, confidence, source = select_subject_box(frame, point, self.config)
                         points = self._features(gray, box, maximum_points)
                         source = "reinitialized_" + source

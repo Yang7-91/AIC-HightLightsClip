@@ -1,0 +1,30 @@
+schema_version: stage3.5.v1
+
+api:
+  base_url: "http://172.25.254.120:8000/v1"
+  api_key: "EMPTY"
+  model: "QuantTrio/Qwen3.5-4B-AWQ"
+  timeout_sec: 300.0
+  max_retries: 2
+  healthcheck_on_start: true
+
+generation:
+  temperature: 0.0
+  top_p: 0.9
+  max_tokens: 4096
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+sampling:
+  # 按 Stage 3 最终区间从原视频重新即时采样，不使用 Stage 1 coarse_frames。
+  fps: 2.0
+  jpeg_quality: 85
+  max_side: 1024
+
+parsing:
+  retries: 1
+
+runtime:
+  mode: predict
+  backend: openai

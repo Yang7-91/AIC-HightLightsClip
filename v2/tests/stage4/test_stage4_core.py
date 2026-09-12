@@ -56,24 +56,26 @@ class GeometryTests(unittest.TestCase):
 
 
 class CenterPipelineTests(unittest.TestCase):
-    def test_stage4_consumes_stage1_and_stage3_without_stage2(self) -> None:
+    def test_stage4_consumes_stage1_and_stage3_5_without_stage3(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stage1_video = root / "stage1/videos/0"
-            stage3_video = root / "stage3/videos/0"
+            stage3_5_video = root / "stage3_5/videos/0"
             stage1_video.mkdir(parents=True)
-            stage3_video.mkdir(parents=True)
+            stage3_5_video.mkdir(parents=True)
             write_json(stage1_video / "metadata.json", {"video_id": "0", "source_path": "not-used.mp4", "width": 720, "height": 1280, "display_width": 720, "display_height": 1280, "frame_count": 20, "fps": 30.0, "targetRatioWH": [16, 9]})
             write_jsonl(stage1_video / "scenes.jsonl", [{"scene_id": 0, "start_frame": 0, "end_frame": 20}])
             write_json(stage1_video / "_SUCCESS.json", {"status": "success"})
-            write_jsonl(stage3_video / "refined_intervals.jsonl", [{"video_id": "0", "interval_id": "0_interval_0000", "start_frame": 2, "end_frame": 6, "subject": "dog", "subject_point": None}])
-            write_json(stage3_video / "_SUCCESS.json", {"status": "success"})
-            summary = run_stage4(root / "stage1", root / "stage3", root / "stage4", center_config(), strict=True)
+            write_jsonl(stage3_5_video / "enriched_intervals.jsonl", [{"video_id": "0", "interval_id": "0_interval_0000", "start_frame": 2, "end_frame": 6, "subject": "dog"}])
+            write_jsonl(stage3_5_video / "subject_points.jsonl", [{"video_id": "0", "interval_id": "0_interval_0000", "sample_index": 0, "frame": 2, "subject_point": [0.3, 0.4]}])
+            write_json(stage3_5_video / "_SUCCESS.json", {"status": "success"})
+            summary = run_stage4(root / "stage1", root / "stage3_5", root / "stage4", center_config(), strict=True)
             rows = [json.loads(line) for line in (root / "stage4/videos/0/crops.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual([row["frame"] for row in rows], [2, 3, 4, 5])
             self.assertTrue(all(len(row["bboxes"]) == 3 for row in rows))
             self.assertFalse((root / "stage2").exists())
+            self.assertFalse((root / "stage3").exists())
 
 
 if __name__ == "__main__":
