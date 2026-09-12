@@ -1,1 +1,48 @@
-# Stage 3 时序边界细化配置占位。
+schema_version: stage3.v1
+
+runtime:
+  # refine: 正常执行高帧率解码和边界细化；passthrough: 完全跳过处理。
+  mode: refine
+  candidate_error_policy: passthrough
+
+decode:
+  fps: 10.0
+  max_side: 320
+  context_sec: 0.0
+
+features:
+  scene_boundary_radius_sec: 0.4
+
+temporal:
+  # 当前不涉及训练，默认使用无权重规则后端；有 TorchScript 权重后可切换 tcn。
+  backend: rule
+  rule:
+    weights:
+      motion: 0.55
+      audio: 0.20
+      quality: 0.10
+      scene: 0.15
+    coarse_weight: 0.30
+    semantic_category_coarse_weight: 0.55
+    boundary_scene_weight: 0.35
+    smooth_window: 5
+  tcn:
+    checkpoint: model_store/temporal/temporal_head.ts
+    device: cuda
+
+boundary:
+  core_threshold: 0.50
+  core_quantile: 0.65
+  min_dynamic_range: 0.08
+  max_trim_sec: 1.5
+  min_duration_sec: 0.5
+
+empty_gate:
+  enabled: true
+  max_coarse_threshold: 0.30
+  max_temporal_threshold: 0.25
+
+merging:
+  enabled: true
+  max_gap_frames: 2
+  require_same_category: true

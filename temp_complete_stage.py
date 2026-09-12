@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stage 2 之后的快速闭环验证脚本。
+"""把 V2 Stage 2 粗高光结果转换为比赛逐帧重构图结果。
 
-本脚本参考 ``baseline_qwen.py`` 的确定性后处理方式，但跳过边界精定位、
-主体定位、跟踪和平滑，只完成以下流程：
+本脚本复用 ``baseline_qwen.py`` 原始 Stage 2 的思路：
 
 1. 读取 Stage 2 每个视频的 ``candidates.jsonl``；
-2. 合并重叠、相邻或间隔不超过阈值的粗高光区间；
+2. 防御性合并仍有重叠的候选（默认不跨空白间隔继续合并）；
 3. 把秒级区间转换为原视频帧区间；
-4. 计算符合 ``targetRatioWH`` 的中心最大内接裁剪框；
-5. 为高光区间内每一帧输出比赛要求的 ``[x, y, w]``；
-6. 生成最终 ``predictions.jsonl`` 和便于人工检查的区间诊断 JSONL。
+4. 根据目标比例和源尺寸确定唯一的最大内接裁剪框尺寸；
+5. 按固定帧间隔抽取关键帧，通过 Qwen-VL 预测重要主体的归一化中心点；
+6. 把裁剪窗放到预测中心并夹紧在源画面内；
+7. 在关键帧裁剪框之间线性插值，生成高光区间内每一帧的 ``[x, y, w]``；
+8. 生成最终 ``predictions.jsonl``、模型原始响应和区间诊断 JSONL。
 
 这里的“裁剪”指生成比赛提交所需的逐帧裁剪框，不会重新编码或导出 MP4。
-该版本主要用于快速验证 Stage 2 高光召回结果能否走通完整提交链路。
+Stage 2 候选中的 ``subject`` 会作为可选提示传给主体定位模型，但最终坐标仍
+以关键帧图像的模型预测为准。某些关键帧调用失败时会使用其余成功关键帧插值；
+若一个区间全部失败，则默认回退到画面中心，保证输出完整。
 
 示例：
     python temp_complete_stage.py `
-      --stage2-dir v2/runs/somke-stage2/stage2 `
       --video-id 0
 
 处理索引中的全部视频：
     python temp_complete_stage.py `
-      --stage2-dir v2/runs/my-stage2/stage2 `
       --out temp_complete_predictions.jsonl
+
+处理其他 Stage 2 实验目录：
+    python temp_complete_stage.py `
+      --stage2-dir v2/runs/another-run/stage2
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -43,6 +50,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INDEX = SCRIPT_DIR / "test_index.json"
 DEFAULT_VIDEO_DIR = Path("F:/datasets/video-clip/video")
 DEFAULT_OUTPUT = SCRIPT_DIR / "temp_complete_predictions.jsonl"
+DEFAULT_STAGE2_DIR = SCRIPT_DIR / "v2/runs/full/stage2"
+DEFAULT_QWEN_API_BASE = "http://172.25.254.120:8000/v1"
+DEFAULT_QWEN_MODEL = "QuantTrio/Qwen3.5-4B-AWQ"
 
 
 class ValidationError(RuntimeError):
@@ -71,6 +81,7 @@ class Interval:
     end_sec: float
     candidate_ids: tuple[str, ...]
     max_score: float
+    subjects: tuple[str, ...]
 
 
 def load_index(path: Path) -> list[tuple[str, tuple[float, float]]]:
@@ -205,8 +216,15 @@ def candidate_intervals(
         if end_sec <= start_sec:
             continue
         candidate_id = str(row.get("candidate_id", f"{video_id}_raw_{index:04d}"))
+        subject = str(row.get("subject") or "").strip()
         intervals.append(
-            Interval(start_sec, end_sec, (candidate_id,), score)
+            Interval(
+                start_sec,
+                end_sec,
+                (candidate_id,),
+                score,
+                (subject,) if subject else (),
+            )
         )
     return intervals
 
@@ -228,6 +246,7 @@ def merge_intervals(intervals: Iterable[Interval], max_gap_sec: float) -> list[I
             end_sec=max(previous.end_sec, current.end_sec),
             candidate_ids=tuple(dict.fromkeys(previous.candidate_ids + current.candidate_ids)),
             max_score=max(previous.max_score, current.max_score),
+            subjects=tuple(dict.fromkeys(previous.subjects + current.subjects)),
         )
     return merged
 
@@ -235,7 +254,7 @@ def merge_intervals(intervals: Iterable[Interval], max_gap_sec: float) -> list[I
 def seconds_to_frame_ranges(
     intervals: Iterable[Interval], fps: float, frame_count: int
 ) -> list[tuple[int, int]]:
-    """按 baseline_qwen 的 round 规则将秒区间转换为闭区间帧号。"""
+    """按 baseline_qwen 的 round 规则逐一转换为闭区间帧号。"""
 
     ranges: list[tuple[int, int]] = []
     for interval in intervals:
@@ -245,15 +264,7 @@ def seconds_to_frame_ranges(
         end_frame = max(0, min(end_frame, frame_count - 1))
         if end_frame >= start_frame:
             ranges.append((start_frame, end_frame))
-
-    # 秒域合并后再做一次帧域相邻合并，消除浮点换算和取整带来的重复帧。
-    merged: list[list[int]] = []
-    for start_frame, end_frame in sorted(ranges):
-        if merged and start_frame <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], end_frame)
-        else:
-            merged.append([start_frame, end_frame])
-    return [(start, end) for start, end in merged]
+    return ranges
 
 
 def compute_crop_size(
@@ -269,11 +280,16 @@ def compute_crop_size(
     target_ratio = target_width / target_height
     source_ratio = source_width / source_height
     if source_ratio >= target_ratio:
-        crop_height = source_height
-        crop_width = min(int(round(crop_height * target_ratio)), source_width)
+        # 提交只写宽度，评测端会按比例反算高度。宽度必须向下取整，否则像
+        # 9:16@1920x1080 会因 round(607.5)=608 而反算出 1080.44，造成越界。
+        crop_width = min(int(math.floor(source_height * target_ratio + 1e-9)), source_width)
     else:
         crop_width = source_width
-        crop_height = min(int(round(crop_width / target_ratio)), source_height)
+    # 内部用 ceil 表示反算高度实际占用的像素范围，夹紧 y 时更保守。
+    crop_height = min(
+        int(math.ceil(crop_width / target_ratio - 1e-9)),
+        source_height,
+    )
     return max(1, crop_width), max(1, crop_height)
 
 
@@ -290,17 +306,358 @@ def centered_crop_box(meta: VideoMeta, target_ratio: tuple[float, float]) -> tup
     return x, y, crop_width, crop_height
 
 
-def build_predictions(
-    frame_ranges: Iterable[tuple[int, int]], crop_box: tuple[int, int, int, int]
-) -> list[dict[str, Any]]:
-    """为所有高光帧生成比赛格式记录；高度不写入 bboxes。"""
+def center_to_box(
+    center_x: float,
+    center_y: float,
+    meta: VideoMeta,
+    crop_width: int,
+    crop_height: int,
+) -> tuple[int, int, int, int]:
+    """把 0~1 主体中心转换为裁剪框，并把窗口夹紧到源画面内。"""
 
-    x, y, width, _height = crop_box
-    return [
-        {"frame": frame, "bboxes": [x, y, width]}
-        for start_frame, end_frame in frame_ranges
-        for frame in range(start_frame, end_frame + 1)
+    center_x = max(0.0, min(1.0, float(center_x)))
+    center_y = max(0.0, min(1.0, float(center_y)))
+    x = int(round(center_x * meta.width - crop_width / 2.0))
+    y = int(round(center_y * meta.height - crop_height / 2.0))
+    x = max(0, min(x, meta.width - crop_width))
+    y = max(0, min(y, meta.height - crop_height))
+    return x, y, crop_width, crop_height
+
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def parse_focus_norm(text: str, width: int, height: int) -> tuple[float, float] | None:
+    """解析 Qwen 输出，兼容 0~1、0~1000 和绝对像素坐标。"""
+
+    candidate: tuple[float, float] | None = None
+    objects: list[Any] = []
+    try:
+        objects.append(json.loads(text))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for match in re.finditer(r"\{[^{}]*\}", text, re.DOTALL):
+        try:
+            objects.append(json.loads(match.group(0)))
+        except json.JSONDecodeError:
+            continue
+    for value in objects:
+        if not isinstance(value, dict):
+            continue
+        for key in ("center", "subject_center", "focus", "point", "cxcy"):
+            point = value.get(key)
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                try:
+                    candidate = float(point[0]), float(point[1])
+                except (TypeError, ValueError):
+                    continue
+    if candidate is None:
+        numbers = _NUMBER_RE.findall(text)
+        if len(numbers) >= 2:
+            candidate = float(numbers[-2]), float(numbers[-1])
+    if candidate is None or not all(math.isfinite(value) for value in candidate):
+        return None
+
+    def normalize(value: float, size: int) -> float:
+        if -0.01 <= value <= 1.5:
+            normalized = value
+        elif -1.0 <= value <= 1000.0:
+            normalized = value / 1000.0
+        else:
+            normalized = value / float(size)
+        return max(0.0, min(1.0, normalized))
+
+    return normalize(candidate[0], width), normalize(candidate[1], height)
+
+
+class QwenFocusClient:
+    """仅负责关键帧主体中心预测的 OpenAI 兼容 Qwen-VL 客户端。"""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_sec: float,
+        max_retries: int,
+    ) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ValidationError("缺少 openai 包，请先在 video-clip 环境中安装") from exc
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url.rstrip("/") + "/",
+            timeout=timeout_sec,
+            max_retries=max_retries,
+        )
+        self.model = model
+
+    def healthcheck(self) -> None:
+        """确认接口可达，且服务端暴露了配置的模型名。"""
+
+        try:
+            model_ids = {str(item.id) for item in self.client.models.list().data}
+        except Exception as exc:
+            raise ValidationError(f"Qwen API 健康检查失败: {exc}") from exc
+        if self.model not in model_ids:
+            raise ValidationError(
+                f"Qwen API 未暴露模型 {self.model!r}；当前模型: {sorted(model_ids)}"
+            )
+
+    def predict_focus(
+        self,
+        bgr_frame: Any,
+        target_ratio: tuple[float, float],
+        subject_hint: str,
+        max_new_tokens: int,
+        enable_thinking: bool,
+        thinking_token_budget: int,
+        jpeg_quality: int,
+    ) -> dict[str, Any]:
+        """发送单张关键帧，返回可直接写入 JSONL 的普通字典。"""
+
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ValidationError("缺少 opencv-python，请先在 video-clip 环境中安装") from exc
+        ok, encoded = cv2.imencode(
+            ".jpg", bgr_frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+        )
+        if not ok:
+            raise ValidationError("关键帧 JPEG 编码失败")
+        image_url = "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+        target_w, target_h = target_ratio
+        hint = subject_hint.strip()
+        hint_line = (
+            f"The coarse highlight detector suggests the subject is: {hint[:300]}.\n"
+            if hint
+            else ""
+        )
+        prompt = (
+            f"This video frame will be cropped to {target_w:g}:{target_h:g}.\n"
+            f"{hint_line}"
+            "Locate the center of the most important visible subject or region that must remain "
+            "inside the crop. Return normalized integer coordinates from 0 to 1000, where x=0 "
+            "is left, x=1000 is right, y=0 is top, and y=1000 is bottom.\n"
+            "Return only one JSON object, for example: {\"center\": [500, 500]}"
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "center": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                }
+            },
+            "required": ["center"],
+            "additionalProperties": False,
+        }
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            max_completion_tokens=max_new_tokens,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "focus", "strict": True, "schema": schema},
+            },
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+                "thinking_token_budget": thinking_token_budget,
+            },
+        )
+        choice = completion.choices[0]
+        message = choice.message
+        reasoning = getattr(message, "reasoning", None)
+        if reasoning is None:
+            reasoning = getattr(message, "reasoning_content", None)
+        usage = getattr(completion, "usage", None)
+        if usage is not None and hasattr(usage, "model_dump"):
+            usage = usage.model_dump(mode="json")
+        elif usage is not None and not isinstance(usage, (dict, str, int, float, bool)):
+            usage = str(usage)
+        return {
+            "content": message.content,
+            "reasoning": reasoning if isinstance(reasoning, (str, type(None))) else str(reasoning),
+            "finish_reason": choice.finish_reason,
+            "usage": usage,
+            "request_id": getattr(completion, "id", None),
+        }
+
+
+def keyframe_ids(start_frame: int, end_frame: int, stride: int) -> list[int]:
+    """按固定步长采样，并保证区间首尾帧一定被包含。"""
+
+    frames = list(range(start_frame, end_frame + 1, max(1, stride)))
+    if not frames or frames[-1] != end_frame:
+        frames.append(end_frame)
+    return frames
+
+
+def extract_frames(video_path: Path, frame_ids: Iterable[int]) -> dict[int, Any]:
+    """从最小到最大目标帧顺序解码，避免对每个关键帧重复随机 seek。"""
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ValidationError("缺少 opencv-python，请先在 video-clip 环境中安装") from exc
+    wanted = sorted(set(int(value) for value in frame_ids))
+    if not wanted:
+        return {}
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValidationError(f"无法打开视频: {video_path}")
+    result: dict[int, Any] = {}
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
+        wanted_set = set(wanted)
+        frame_id = wanted[0]
+        while frame_id <= wanted[-1]:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame_id in wanted_set:
+                result[frame_id] = frame
+            frame_id += 1
+    finally:
+        capture.release()
+    return result
+
+
+def densify_boxes(
+    start_frame: int,
+    end_frame: int,
+    key_frames: list[int],
+    key_boxes: list[tuple[int, int, int, int]],
+) -> dict[int, tuple[int, int, int, int]]:
+    """在相邻关键帧裁剪框间线性插值，得到区间内每一帧的框。"""
+
+    if not key_frames:
+        return {}
+    points = sorted(zip(key_frames, key_boxes), key=lambda item: item[0])
+    frames = [item[0] for item in points]
+    boxes = [item[1] for item in points]
+    dense: dict[int, tuple[int, int, int, int]] = {}
+    left_index = 0
+    for frame_id in range(start_frame, end_frame + 1):
+        while left_index + 1 < len(frames) and frames[left_index + 1] < frame_id:
+            left_index += 1
+        if frame_id <= frames[0]:
+            dense[frame_id] = boxes[0]
+        elif frame_id >= frames[-1]:
+            dense[frame_id] = boxes[-1]
+        else:
+            right_index = left_index + 1
+            left_frame, right_frame = frames[left_index], frames[right_index]
+            ratio = (frame_id - left_frame) / float(right_frame - left_frame)
+            dense[frame_id] = tuple(
+                int(round(boxes[left_index][axis] + (boxes[right_index][axis] - boxes[left_index][axis]) * ratio))
+                for axis in range(4)
+            )
+    return dense
+
+
+def reframe_interval(
+    model: QwenFocusClient,
+    video_path: Path,
+    video_id: str,
+    interval: Interval,
+    frame_range: tuple[int, int],
+    target_ratio: tuple[float, float],
+    meta: VideoMeta,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """预测一个高光区间的关键帧中心，并插值得到逐帧比赛框。"""
+
+    start_frame, end_frame = frame_range
+    requested_frames = keyframe_ids(start_frame, end_frame, args.crop_stride)
+    decoded_frames = extract_frames(video_path, requested_frames)
+    crop_width, crop_height = compute_crop_size(
+        meta.width, meta.height, target_ratio[0], target_ratio[1]
+    )
+    subject_hint = " / ".join(interval.subjects)
+    successful_frames: list[int] = []
+    successful_boxes: list[tuple[int, int, int, int]] = []
+    raw_records: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for frame_id in requested_frames:
+        frame = decoded_frames.get(frame_id)
+        if frame is None:
+            failures.append({"frame": frame_id, "error": "关键帧解码失败"})
+            continue
+        try:
+            raw = model.predict_focus(
+                frame,
+                target_ratio,
+                subject_hint,
+                args.focus_max_new_tokens,
+                args.focus_enable_thinking,
+                args.focus_thinking_budget,
+                args.jpeg_quality,
+            )
+            raw_records.append(
+                {
+                    "video_id": video_id,
+                    "frame": frame_id,
+                    "stage": "subject_focus",
+                    "candidate_ids": list(interval.candidate_ids),
+                    "subject_hint": subject_hint or None,
+                    "raw": raw,
+                }
+            )
+            content = raw.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("模型返回 content 为空或不是字符串")
+            center = parse_focus_norm(content, meta.width, meta.height)
+            if center is None:
+                raise ValueError(f"无法从模型输出解析主体中心: {content[:200]!r}")
+            successful_frames.append(frame_id)
+            successful_boxes.append(
+                center_to_box(center[0], center[1], meta, crop_width, crop_height)
+            )
+        except Exception as exc:
+            failures.append({"frame": frame_id, "error": str(exc)})
+            if args.focus_failure == "error":
+                raise ValidationError(f"主体定位失败: {video_id}#{frame_id}: {exc}") from exc
+
+    used_center_fallback = False
+    if not successful_frames:
+        used_center_fallback = True
+        fallback_box = center_to_box(0.5, 0.5, meta, crop_width, crop_height)
+        successful_frames = [start_frame, end_frame]
+        successful_boxes = [fallback_box, fallback_box]
+    dense = densify_boxes(
+        start_frame, end_frame, successful_frames, successful_boxes
+    )
+    predictions = [
+        {
+            "frame": frame_id,
+            "bboxes": [dense[frame_id][0], dense[frame_id][1], dense[frame_id][2]],
+        }
+        for frame_id in range(start_frame, end_frame + 1)
+        if frame_id in dense
     ]
+    diagnostic = {
+        "candidate_ids": list(interval.candidate_ids),
+        "subject_hints": list(interval.subjects),
+        "requested_keyframes": requested_frames,
+        "successful_keyframes": successful_frames,
+        "keyframe_boxes_xywh": [list(box) for box in successful_boxes],
+        "focus_failures": failures,
+        "used_center_fallback": used_center_fallback,
+    }
+    return predictions, raw_records, diagnostic
 
 
 def _open_atomic_target(path: Path) -> tuple[TextIO, Path]:
@@ -333,12 +690,20 @@ def _target_ratio_for_output(target_ratio: tuple[float, float]) -> list[int | fl
 
 
 def run(args: argparse.Namespace) -> tuple[int, int]:
-    """执行快速闭环，返回 ``(视频数, 预测帧数)``。"""
+    """执行 Stage 2 候选到逐帧重构图的闭环。"""
 
     if not math.isfinite(args.min_score):
         raise ValidationError("min_score 必须是有限数值")
+    if not math.isfinite(args.merge_gap_sec) or args.merge_gap_sec < 0:
+        raise ValidationError("merge_gap_sec 必须是有限非负数")
     if args.num_videos < 0:
         raise ValidationError("num_videos 不能小于 0")
+    if args.crop_stride <= 0:
+        raise ValidationError("crop_stride 必须大于 0")
+    if args.focus_max_new_tokens <= 0 or args.focus_thinking_budget < 0:
+        raise ValidationError("主体定位 token 参数无效")
+    if not 1 <= args.jpeg_quality <= 100:
+        raise ValidationError("jpeg_quality 必须在 1~100")
 
     stage2_videos_dir = resolve_stage2_videos_dir(args.stage2_dir)
     index = load_index(args.index)
@@ -366,15 +731,32 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
         if args.intervals_out is not None
         else output_path.with_name(f"{output_path.stem}.intervals.jsonl")
     )
-    if intervals_path == output_path:
-        raise ValidationError("--intervals-out 不能与 --out 指向同一个文件")
+    raw_path = (
+        args.raw_out.resolve()
+        if args.raw_out is not None
+        else output_path.with_name(f"{output_path.stem}.raw.jsonl")
+    )
+    if len({output_path, intervals_path, raw_path}) != 3:
+        raise ValidationError("--out、--intervals-out 和 --raw-out 必须指向不同文件")
+
+    model = QwenFocusClient(
+        args.qwen_api_base,
+        args.qwen_api_key,
+        args.qwen_model_name,
+        args.qwen_timeout,
+        args.qwen_max_retries,
+    )
+    if not args.no_healthcheck:
+        model.healthcheck()
 
     prediction_handle, prediction_tmp = _open_atomic_target(output_path)
     interval_handle, interval_tmp = _open_atomic_target(intervals_path)
+    raw_handle, raw_tmp = _open_atomic_target(raw_path)
     total_predictions = 0
+    total_model_calls = 0
 
     try:
-        with prediction_handle, interval_handle:
+        with prediction_handle, interval_handle, raw_handle:
             for position, (video_id, target_ratio) in enumerate(index, start=1):
                 extension = args.video_extension
                 if extension and not extension.startswith("."):
@@ -389,7 +771,8 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
                     "source_candidate_count": 0,
                     "merged_intervals": [],
                     "frame_ranges": [],
-                    "crop_box_xywh": None,
+                    "crop_size_wh": None,
+                    "reframing": [],
                     "video_meta": None,
                 }
 
@@ -413,8 +796,43 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
                         frame_ranges = seconds_to_frame_ranges(
                             merged_intervals, meta.fps, meta.frame_count
                         )
-                        crop_box = centered_crop_box(meta, target_ratio)
-                        predictions = build_predictions(frame_ranges, crop_box)
+                        if len(frame_ranges) != len(merged_intervals):
+                            raise ValidationError(
+                                f"{video_id} 的候选区间无法转换为有效帧区间"
+                            )
+                        crop_width, crop_height = compute_crop_size(
+                            meta.width, meta.height, target_ratio[0], target_ratio[1]
+                        )
+                        prediction_by_frame: dict[int, dict[str, Any]] = {}
+                        reframing_diagnostics: list[dict[str, Any]] = []
+                        for interval, frame_range in zip(merged_intervals, frame_ranges):
+                            interval_predictions, raw_records, reframe_diagnostic = reframe_interval(
+                                model,
+                                video_path,
+                                video_id,
+                                interval,
+                                frame_range,
+                                target_ratio,
+                                meta,
+                                args,
+                            )
+                            for record in raw_records:
+                                raw_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            total_model_calls += len(raw_records)
+                            for prediction in interval_predictions:
+                                prediction_by_frame[int(prediction["frame"])] = prediction
+                            reframing_diagnostics.append(
+                                {
+                                    "start_sec": interval.start_sec,
+                                    "end_sec": interval.end_sec,
+                                    "frame_range": list(frame_range),
+                                    **reframe_diagnostic,
+                                }
+                            )
+                        predictions = [
+                            prediction_by_frame[frame_id]
+                            for frame_id in sorted(prediction_by_frame)
+                        ]
                         diagnostic.update(
                             {
                                 "merged_intervals": [
@@ -423,11 +841,13 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
                                         "end_sec": item.end_sec,
                                         "candidate_ids": list(item.candidate_ids),
                                         "max_score": item.max_score,
+                                        "subjects": list(item.subjects),
                                     }
                                     for item in merged_intervals
                                 ],
                                 "frame_ranges": [list(item) for item in frame_ranges],
-                                "crop_box_xywh": list(crop_box),
+                                "crop_size_wh": [crop_width, crop_height],
+                                "reframing": reframing_diagnostics,
                                 "video_meta": {
                                     "frame_count": meta.frame_count,
                                     "fps": meta.fps,
@@ -450,36 +870,50 @@ def run(args: argparse.Namespace) -> tuple[int, int]:
                 }
                 prediction_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 interval_handle.write(json.dumps(diagnostic, ensure_ascii=False) + "\n")
+                prediction_handle.flush()
+                interval_handle.flush()
+                raw_handle.flush()
                 total_predictions += len(predictions)
+                focus_failures = sum(
+                    len(item.get("focus_failures", []))
+                    for item in diagnostic["reframing"]
+                )
                 print(
                     f"[{position}/{len(index)}] video={video_id} "
                     f"candidates={diagnostic['source_candidate_count']} "
                     f"merged={len(diagnostic['merged_intervals'])} "
-                    f"frames={len(predictions)}"
+                    f"frames={len(predictions)} focus_failures={focus_failures}"
                 )
         os.replace(prediction_tmp, output_path)
         os.replace(interval_tmp, intervals_path)
+        os.replace(raw_tmp, raw_path)
     except BaseException:
         prediction_handle.close()
         interval_handle.close()
+        raw_handle.close()
         prediction_tmp.unlink(missing_ok=True)
         interval_tmp.unlink(missing_ok=True)
+        raw_tmp.unlink(missing_ok=True)
         raise
 
-    print(f"完成: {len(index)} 个视频，{total_predictions} 条逐帧预测 -> {output_path}")
+    print(
+        f"完成: {len(index)} 个视频，{total_predictions} 条逐帧预测，"
+        f"{total_model_calls} 次有效模型响应 -> {output_path}"
+    )
     print(f"区间与裁剪框诊断 -> {intervals_path}")
+    print(f"主体定位模型原始响应 -> {raw_path}")
     return len(index), total_predictions
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="合并 Stage 2 粗高光区间并生成中心最大裁剪框提交结果",
+        description="读取 V2 Stage 2 候选，用 Qwen 关键帧主体中心生成逐帧裁剪框",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--stage2-dir",
         type=Path,
-        required=True,
+        default=DEFAULT_STAGE2_DIR,
         help="Stage 2 根目录或其 videos 子目录",
     )
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX, help="测试索引 JSON")
@@ -490,6 +924,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="区间诊断 JSONL；默认放在 --out 同目录",
+    )
+    parser.add_argument(
+        "--raw-out",
+        type=Path,
+        default=None,
+        help="主体定位原始响应 JSONL；默认放在 --out 同目录",
     )
     parser.add_argument(
         "--video-id",
@@ -506,8 +946,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merge-gap-sec",
         type=float,
-        default=1.0,
-        help="间隔不超过该秒数的粗候选也合并",
+        default=0.0,
+        help="Stage 2 已完成主合并；这里只防御性合并重叠区间，可按需允许额外间隔",
     )
     parser.add_argument(
         "--min-score",
@@ -516,6 +956,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="丢弃 coarse_score 低于该值的候选",
     )
     parser.add_argument("--video-extension", default=".mp4", help="源视频扩展名")
+    parser.add_argument(
+        "--crop-stride",
+        type=int,
+        default=15,
+        help="主体定位关键帧步长（原视频帧数）；区间首尾帧总会被包含",
+    )
+    parser.add_argument("--qwen-api-base", default=DEFAULT_QWEN_API_BASE)
+    parser.add_argument(
+        "--qwen-api-key",
+        default=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+    )
+    parser.add_argument("--qwen-model-name", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument("--qwen-timeout", type=float, default=300.0)
+    parser.add_argument("--qwen-max-retries", type=int, default=2)
+    parser.add_argument(
+        "--focus-max-new-tokens",
+        type=int,
+        default=256,
+        help="每张关键帧主体中心响应的最大 token 数",
+    )
+    parser.add_argument(
+        "--focus-enable-thinking",
+        action="store_true",
+        help="主体中心定位开启思考；默认关闭以减少延迟和 JSON 截断",
+    )
+    parser.add_argument(
+        "--focus-thinking-budget",
+        type=int,
+        default=1024,
+        help="开启主体定位思考时的 thinking token 预算",
+    )
+    parser.add_argument("--jpeg-quality", type=int, default=90)
+    parser.add_argument(
+        "--focus-failure",
+        choices=("center", "error"),
+        default="center",
+        help="关键帧定位失败策略：继续并在全失败时居中，或立即报错",
+    )
+    parser.add_argument(
+        "--no-healthcheck",
+        action="store_true",
+        help="启动时不检查 Qwen API 和模型名",
+    )
     parser.add_argument(
         "--strict",
         action="store_true",

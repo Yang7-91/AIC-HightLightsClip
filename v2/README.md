@@ -1,6 +1,6 @@
 # Video Highlight Pipeline V2
 
-五阶段视频高光剪辑推理工程。目前已完成 Stage 1：
+五阶段视频高光剪辑推理工程。目前已完成 Stage 1 至 Stage 5：
 
 - FFprobe 读取视频流、音频流、FPS、时间基、尺寸、旋转和时长；
 - PySceneDetect `ContentDetector` 完成硬切镜头检测，可选 `ThresholdDetector` 检测渐变；
@@ -8,6 +8,8 @@
 - 建立抽样帧、原始帧、时间戳和镜头编号映射；
 - 按 24 秒窗口、25% 重叠和镜头边界规划 Stage 2 分析片段；
 - FFmpeg 保留 16 kHz 连续音轨，生成基础声学特征、事件和时间线；
+- 生成粗高光候选、细化帧级边界，并完成主体跟踪与平滑构图；
+- 按原始索引顺序生成和严格校验最终比赛提交 JSONL；
 - 每个视频独立持久化、异常隔离，并支持恢复运行。
 
 ## 数据位置
@@ -142,9 +144,126 @@ _SUCCESS.json
 响应中的相对时间由确定性代码映射为原视频绝对时间，重叠窗口候选会扩展、
 合并并生成稳定的 `candidate_id`。Base64 本体不会写入请求日志。
 
+## Stage 3：高光候选帧级边界定位
+
+Stage 3 读取同批次的 Stage 1 元数据和 Stage 2 候选。默认只对候选区间进行
+10 FPS 精解码，提取运动、直方图变化、清晰度、亮度、音频、镜头边界和
+Stage 2 粗分数，通过无训练规则后端保守细化边界，并映射成原始视频的左闭
+右开帧区间 `[start_frame, end_frame)`。
+
+正常运行：
+
+```powershell
+python scripts/run_stage3.py `
+  --stage1-dir runs/full/stage1 `
+  --stage2-dir runs/full/stage2 `
+  --run-id full_stage3 `
+  --strict
+```
+
+完全跳过 Stage 3 处理，只把 Stage 2 秒区间映射并封装为合法 Stage 3 输出：
+
+```powershell
+python scripts/run_stage3.py `
+  --stage1-dir runs/full/stage1 `
+  --stage2-dir runs/full/stage2 `
+  --run-id full_stage3_passthrough `
+  --skip-processing `
+  --strict
+```
+
+`--skip-processing`（别名 `--passthrough`）不会打开或解码源视频，不提取特征，
+也不会执行边界细化、无高光门控或区间合并。Stage 2 的 `start_sec/end_sec`
+保持原值，只进行 Stage 4 所需的确定性帧号映射。
+
+每个视频输出：
+
+```text
+refined_intervals.jsonl
+diagnostics.jsonl
+_SUCCESS.json
+```
+
+未来获得训练好的 TorchScript TCN 权重后，可用 `--backend tcn --checkpoint ...`
+切换到模型推理；默认规则后端不依赖 PyTorch，也不包含训练代码。
+
+## Stage 4：主体构图与轨迹优化
+
+Stage 4 以 Stage 3 的 `refined_intervals.jsonl` 作为高光区间、主体语义和主体点提示的
+唯一上游契约。它只从 Stage 1 读取源视频路径、原始帧率/尺寸、`targetRatioWH` 和镜头
+边界；命令行没有 Stage 2 参数，也不会读取 Stage 2 产物。
+
+默认使用不需要额外模型权重的 OpenCV 后端：在区间首帧或镜头切换处根据 Stage 3
+主体点初始化；没有主体点时使用中心偏置视觉显著性；随后通过稀疏光流逐帧传播主体框。
+每帧围绕主体生成多尺度、多偏移、运动方向留白的目标比例候选框，使用动态规划选择
+低代价轨迹，再对中心和尺度做限速平滑。镜头边界两侧分别优化，不跨硬切镜头平滑。
+所有框最后统一取整、再次限界，并输出比赛需要的 `[x, y, w]`。
+
+正常运行：
+
+```powershell
+python scripts/run_stage4.py `
+  --stage1-dir runs/full/stage1 `
+  --stage3-dir runs/full/stage3 `
+  --output-dir runs/full/stage4 `
+  --strict
+```
+
+可选后端：
+
+- `--backend opencv`：默认可运行基线，不需要新权重。
+- `--backend center`：不解码视频的中心最大合法框，用于链路检查或区间失败降级。
+- `--backend sam2 --sam2-checkpoint <权重路径> --sam2-config <模型配置>`：使用官方
+  SAM2 视频预测器传播主体 Mask；只有选择该后端时才加载 SAM2 和 PyTorch。
+
+每个视频持久化输出：
+
+```text
+crops.jsonl         # Stage 5 直接消费的逐帧 [x,y,w]
+tracks.jsonl        # 主体 xyxy、置信度和跟踪来源，便于调试
+diagnostics.jsonl   # 区间状态、镜头子段数和降级信息
+_SUCCESS.json
+```
+
+## Stage 5：最终提交 JSONL
+
+Stage 5 只把 Stage 4 的 `crops.jsonl` 作为预测来源。它读取原始 `test_index.json`
+以严格保持视频行顺序，并从 Stage 1 元数据复核目标比例、总帧数和画面尺寸；不读取
+Stage 2 或 Stage 3。导出时删除 Stage 4 的调试字段，仅保留比赛规定字段。
+
+```powershell
+python scripts/run_stage5.py `
+  --stage1-dir runs/full/stage1 `
+  --stage4-dir runs/full/stage4 `
+  --output-dir runs/full/stage5 `
+  --overwrite
+```
+
+`--input-index` 默认取 `configs/paths.yaml` 中的 `input_index`。最终目录包含：
+
+```text
+submission.jsonl       # 可直接提交的最终文件
+validation_report.json # 视频数、预测帧数、空结果数、文件 SHA-256
+resolved_config.json
+run_manifest.json
+_SUCCESS.json
+```
+
+也可脱离生成流程单独复核一个提交文件：
+
+```powershell
+python scripts/validate_submission.py `
+  --submission runs/full/stage5/submission.jsonl `
+  --input-index F:/datasets/video-clip/test_index.json `
+  --stage1-dir runs/full/stage1
+```
+
 ## 测试
 
 ```powershell
 python -m unittest discover -s tests/stage1 -v
 python -m unittest discover -s tests/stage2 -v
+python -m unittest discover -s tests/stage3 -v
+python -m unittest discover -s tests/stage4 -v
+python -m unittest discover -s tests/stage5 -v
 ```

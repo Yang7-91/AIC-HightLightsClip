@@ -1,1 +1,35 @@
-# Stage 3 无训练规则基线配置占位。
+schema_version: stage3.v1
+runtime:
+  mode: refine
+  candidate_error_policy: passthrough
+decode:
+  fps: 8.0
+  max_side: 256
+  context_sec: 0.0
+features:
+  scene_boundary_radius_sec: 0.5
+temporal:
+  backend: rule
+  rule:
+    weights: {motion: 0.60, audio: 0.20, quality: 0.10, scene: 0.10}
+    coarse_weight: 0.40
+    semantic_category_coarse_weight: 0.60
+    boundary_scene_weight: 0.30
+    smooth_window: 5
+  tcn:
+    checkpoint: model_store/temporal/temporal_head.ts
+    device: cpu
+boundary:
+  core_threshold: 0.50
+  core_quantile: 0.65
+  min_dynamic_range: 0.10
+  max_trim_sec: 1.0
+  min_duration_sec: 0.5
+empty_gate:
+  enabled: false
+  max_coarse_threshold: 0.30
+  max_temporal_threshold: 0.25
+merging:
+  enabled: true
+  max_gap_frames: 2
+  require_same_category: true

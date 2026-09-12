@@ -1,1 +1,44 @@
-# Stage 4 SAM2 主体跟踪与构图配置占位。
+schema_version: stage4.v1
+
+runtime:
+  # center: 单个区间跟踪失败时仍输出合法的最大中心构图；error: 直接失败。
+  interval_error_policy: center
+
+tracking:
+  # 默认 OpenCV 后端无需新模型。可通过 CLI 切换 center 或 sam2。
+  backend: opencv
+  initial_width_ratio: 0.28
+  initial_height_ratio: 0.38
+  saliency_max_side: 320
+  max_corners: 120
+  min_confidence: 0.15
+  min_area_ratio: 0.001
+  max_area_ratio: 0.75
+  max_area_change: 3.0
+  max_center_jump: 0.20
+  reinitialize_every_frames: 150
+  checkpoint: model_store/sam2/sam2.1_hiera_small.pt
+  model_config: configs/sam2.1/sam2.1_hiera_s.yaml
+  device: cuda
+  amp_dtype: bfloat16
+
+crop_candidates:
+  scales: [0.55, 0.70, 0.85, 1.0]
+  offsets: [-0.12, 0.0, 0.12]
+  subject_margins: [0.20, 0.20, 0.15, 0.30]
+  motion_look_ahead: 2.0
+
+composition:
+  weights:
+    uncovered: 0.55
+    centering: 0.25
+    zoom: 0.20
+
+optimizer:
+  center_weight: 0.20
+  scale_weight: 0.12
+
+smoothing:
+  center_alpha: 0.25
+  width_alpha: 0.15
+  max_center_step_ratio: 0.04

@@ -1,1 +1,18 @@
-# Stage 5 最终 JSONL 输出与校验配置占位。
+schema_version: stage5.v1
+
+output:
+  # 比赛提交文件：一行对应输入索引中的一个视频。
+  filename: submission.jsonl
+
+quantization:
+  # Stage 4 通常已经是整数；此处仍做最终取整及取整后边界修正。
+  mode: round
+
+validation:
+  # 正式导出默认要求整批及每个视频均有成功标记，防止把半成品提交。
+  require_stage1_run_success: true
+  require_stage1_video_success: true
+  require_stage4_run_success: true
+  require_stage4_video_success: true
+  # 顶层只能有 video_id/targetRatioWH/predictions，帧项只能有 frame/bboxes。
+  strict_fields: true
