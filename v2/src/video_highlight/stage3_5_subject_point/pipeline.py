@@ -112,7 +112,7 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
     raise last_error
 
 
-def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_output_dir: Path, backend: SubjectPointBackend | None, config: dict[str, Any], resume: bool, overwrite: bool) -> dict[str, Any]:
+def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_output_dir: Path, backend: SubjectPointBackend | None, config: dict[str, Any], project_paths_config:dict[str, Any],resume: bool, overwrite: bool) -> dict[str, Any]:
     """处理一个视频，并以目录重命名作为原子提交点。"""
 
     final_dir = videos_output_dir / video_id
@@ -127,7 +127,7 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # Stage 1 粗采样文件从不进入返回值；这里只得到元数据和 Stage 3 最终区间。
-    metadata, intervals = load_video_inputs(stage1_dir, stage3_dir, video_id)
+    metadata, intervals = load_video_inputs(stage1_dir, stage3_dir, video_id,project_paths_config)
     mode = str(config["runtime"].get("mode", "predict"))
     fps = float(metadata["fps"])
     sample_fps = float(config["sampling"].get("fps", 2.0))
@@ -218,7 +218,9 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
     return success
 
 
-def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str | Path, config: dict[str, Any], video_ids: set[str] | None = None, limit: int | None = None, resume: bool = False, overwrite: bool = False, strict: bool = False, logger: Any = None) -> dict[str, Any]:
+def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str | Path, config: dict[str, Any], project_paths_config:dict[str, Any],
+                 video_ids: set[str] | None = None, limit: int | None = None, resume: bool = False,
+                 overwrite: bool = False, strict: bool = False, logger: Any = None) -> dict[str, Any]:
     """批量入口；模型客户端只构建一次，并在所有视频之间复用连接。"""
 
     validate_config(config)
@@ -254,7 +256,7 @@ def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str
         if logger:
             logger.info("[%d/%d] Stage 3.5 处理 video_id=%s mode=%s", position, len(selected), video_id, mode)
         try:
-            record = process_video(stage1_root, stage3_root, video_id, videos_output, backend, config, resume, overwrite)
+            record = process_video(stage1_root, stage3_root, video_id, videos_output, backend, config, project_paths_config,resume, overwrite)
         except Exception as error:
             record = failure_record(video_id, error)
             record["traceback"] = traceback.format_exc()

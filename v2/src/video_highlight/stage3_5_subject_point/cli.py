@@ -53,7 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.output_dir or (runs_root / args.run_id / "stage3_5")
     logger = configure_logging(Path(output_dir) / "stage3_5.log", verbose=args.verbose)
     summary = run_stage3_5(
-        args.stage1_dir, args.stage3_dir, output_dir, config,
+        args.stage1_dir, args.stage3_dir, output_dir, config, project_paths_config,
         video_ids=set(args.video_ids) if args.video_ids else None,
         limit=args.limit, resume=args.resume, overwrite=args.overwrite,
         strict=args.strict, logger=logger,

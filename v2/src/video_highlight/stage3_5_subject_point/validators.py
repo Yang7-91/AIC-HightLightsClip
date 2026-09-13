@@ -29,7 +29,7 @@ def list_stage3_video_ids(stage3_dir: str | Path) -> list[str]:
     return sorted(row.name for row in videos.iterdir() if row.is_dir() and not row.name.startswith(".") and (row / "_SUCCESS.json").is_file())
 
 
-def load_video_inputs(stage1_dir: str | Path, stage3_dir: str | Path, video_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def load_video_inputs(stage1_dir: str | Path, stage3_dir: str | Path, video_id: str,project_paths_config:dict[str, Any],) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     stage1_video = Path(stage1_dir).resolve() / "videos" / video_id
     stage3_video = Path(stage3_dir).resolve() / "videos" / video_id
     if not (stage1_video / "_SUCCESS.json").is_file():
@@ -37,6 +37,9 @@ def load_video_inputs(stage1_dir: str | Path, stage3_dir: str | Path, video_id: 
     if not (stage3_video / "_SUCCESS.json").is_file():
         raise ArtifactValidationError(f"Stage 3 视频没有成功标记: {stage3_video}")
     metadata = _read_object(stage1_video / "metadata.json")
+    # 当切换环境后，视频路径发生改变，此时默认使用配置文件路径，默认mp4
+    if not Path(metadata["source_path"]).is_file():
+        metadata["source_path"] = str(Path(project_paths_config["video_root"]) / (video_id+".mp4"))
     intervals = read_jsonl(stage3_video / "refined_intervals.jsonl")
     if str(metadata.get("video_id")) != video_id:
         raise ArtifactValidationError("Stage 1 metadata.video_id 与目录不一致")
