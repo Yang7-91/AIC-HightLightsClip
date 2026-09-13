@@ -1,0 +1,7 @@
+{
+  "dataset_root": "/root/autodl-tmp/video-clip-data",
+  "input_index": "/root/autodl-tmp/video-clip-data/test_index.json",
+  "video_root": "/root/autodl-tmp/video-clip-data/video",
+  "runs_root": "runs",
+  "model_store": "model_store"
+}
