@@ -11,7 +11,7 @@ api:
 generation:
   temperature: 0.0
   top_p: 0.9
-  max_tokens: 4096
+  max_tokens: 1024
   extra_body:
     chat_template_kwargs:
       enable_thinking: false
@@ -28,3 +28,5 @@ parsing:
 runtime:
   mode: predict
   backend: openai
+  use_batch: false
+  batch_size: 1

@@ -66,11 +66,15 @@ def _enriched_interval(interval: dict[str, Any], sample_count: int, visible_coun
     return row
 
 
-def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[str, Any], frames: list[SampledFrame], backend: SubjectPointBackend, config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[int]]:
-    """构造一次多图请求并解析；解析失败可按配置重试整个区间请求。"""
+def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[str, Any],
+                      frames: list[SampledFrame], backend: SubjectPointBackend,
+                      config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any],
+                      list[dict[str, Any]], list[int],list[dict]]:
+    """构造一次多图请求并解析；解析失败可按配置重试整个区间请求。config配置use_batch为false时1，降级为单帧请求"""
 
+    use_batch = config["runtime"].get("use_batch", False) # 是否使用批次输入
     system_prompt = str(config.get("prompt", {}).get("system", DEFAULT_SYSTEM_PROMPT))
-    prompt = build_prompt(video_id, interval, frames)
+    prompt = build_prompt(video_id, interval, frames,use_batch=use_batch)
     content = build_user_content(prompt, frames)
     retries = max(0, int(config.get("parsing", {}).get("retries", 1)))
     raw_records: list[dict[str, Any]] = []
@@ -85,9 +89,10 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
             **response.to_dict(),
         })
         try:
-            predictions, missing = parse_predictions(response.text, len(frames))
+            predictions, missing, error_predictions = parse_predictions(response.text, frames, use_batch)
             request = {
                 "schema_version": STAGE3_5_SCHEMA_VERSION,
+                "response_id":response.response_id,
                 "video_id": video_id,
                 "interval_id": interval["interval_id"],
                 "subject": interval.get("subject"),
@@ -98,8 +103,9 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
                 "encoded_jpeg_bytes": sum(len(row.jpeg_bytes) for row in frames),
                 "timeline": [{"sample_index": row.sample_index, "frame": row.frame, "timestamp_sec": row.timestamp_sec} for row in frames],
                 "base64_persisted": False,
+                "raw_prompt": {"system_prompt": system_prompt, "user_prompt_short": prompt},
             }
-            return predictions, request, raw_records, missing
+            return predictions, request, raw_records, missing,error_predictions
         except Exception as error:
             last_error = error
     assert last_error is not None
@@ -130,11 +136,11 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
     requests: list[dict[str, Any]] = []
     raw_responses: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    with Timer() as timer:
+    with (Timer() as timer):
         for interval in intervals:
             start, end = int(interval["start_frame"]), int(interval["end_frame"])
             planned_frames = plan_sample_frames(start, end, fps, sample_fps)
-            missing: list[int] = []
+            missing_predictions: list[int] = []
             if mode == "passthrough":
                 # 跳过模式不能调用 sample_interval：即使 source_path 不存在也应能产出契约。
                 predictions = [{"subject_point": None, "confidence": 0.0, "visibility": "not_found", "reason": "stage3_5_processing_skipped"} for _ in planned_frames]
@@ -148,9 +154,25 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                     jpeg_quality=int(config["sampling"].get("jpeg_quality", 85)),
                     max_side=int(config["sampling"].get("max_side", 1024)),
                 )
-                predictions, request, raw, missing = _predict_interval(video_id, interval, metadata, frames, backend, config)
-                requests.append(request)
-                raw_responses.extend(raw)
+                # 一次性最多输入1帧，降低上下文压力，最主要是降低错误概率，只要模型输出中心坐标即可
+                # 目前保留批次输入的能力，以便后续加速
+                step = int(config["runtime"].get("batch_size", 1))
+                chunks_frames = [frames[i:i + step] for i in range(0, len(frames), step)] # 注：Python的切片操作在结束索引超过列表长度时，会自动截断到列表末尾，不会抛出 IndexError
+                predictions: list[dict[str, Any]] = []
+                missing_predictions: list[int] = []
+                error_predictions: list[dict] = []
+                for frames_in_chunk in chunks_frames:
+                    predictions_chunk, request_chunk, raw_response_chunk, missing_predictions_chunk,error_predictions_chunk = \
+                        _predict_interval(video_id, interval, metadata, frames_in_chunk, backend, config)
+                    # 合并单个chunk的predictions、missing_predictions、error_predictions
+                    for prediction in predictions_chunk:
+                        predictions.append(prediction)
+                    for missing_prediction in missing_predictions_chunk:
+                        missing_predictions.append(missing_prediction)
+                    for error_prediction in error_predictions_chunk:
+                        error_predictions.append(error_prediction)
+                    requests.append(request_chunk)
+                    raw_responses.extend(raw_response_chunk)
             interval_points = [
                 _point_row(video_id, interval, index, frame, fps, predictions[index], mode)
                 for index, frame in enumerate(planned_frames)
@@ -166,7 +188,8 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 "status": "skipped_all_stage3_5_processing" if mode == "passthrough" else "completed",
                 "planned_sample_count": len(planned_frames),
                 "visible_point_count": visible_count,
-                "model_omitted_sample_indices": missing,
+                "model_omitted_sample_indices": missing_predictions,
+                "error_predictions": error_predictions,
             })
             # 区间完成即刷新临时目录；若批处理中断，现有内容仍不会被下游当成成功产物。
             write_jsonl(work_dir / "subject_points.jsonl", point_rows)

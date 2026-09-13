@@ -95,7 +95,7 @@ class OpenAIQwenBackend:
         if not text.strip():
             raise ExternalToolError(f"Qwen API 返回空 content（finish_reason={finish_reason!r}）")
         if finish_reason == "length":
-            raise ExternalToolError("Qwen API 输出达到 max_tokens 而被截断")
+            raise ExternalToolError(f"Qwen API 输出达到 max_tokens 而被截断,raw_response={choice!r}")
         usage = response.usage.model_dump(mode="json") if response.usage is not None else None
         return ModelResponse(text, getattr(response, "id", None), getattr(response, "model", None), finish_reason, usage)
 

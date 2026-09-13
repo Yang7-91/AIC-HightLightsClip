@@ -40,7 +40,7 @@ class SamplingTests(unittest.TestCase):
 class ParserTests(unittest.TestCase):
     def test_missing_sample_is_explicitly_filled(self) -> None:
         text = json.dumps({"predictions": [{"sample_index": 0, "subject_point": [0.25, 0.75], "confidence": 0.9, "visibility": "visible", "reason": "ok"}]})
-        rows, missing = parse_predictions(text, 2)
+        rows, missing,_errors = parse_predictions(text, 2) # 源码已修改，测试代码还未修改
         self.assertEqual(missing, [1])
         self.assertEqual(rows[0]["subject_point"], [0.25, 0.75])
         self.assertIsNone(rows[1]["subject_point"])
