@@ -21,6 +21,10 @@ sampling:
   fps: 2.0
   jpeg_quality: 85
   max_side: 1024
+  # auto: OpenCV 快路径失败时，使用带 BT.709 色彩覆盖的 FFmpeg 内存回退。
+  # ffmpeg: 可用于主动处理 trc=log316 等异常色彩元数据视频。
+  decoder: auto
+  ffmpeg_bin: ffmpeg
 
 parsing:
   retries: 1

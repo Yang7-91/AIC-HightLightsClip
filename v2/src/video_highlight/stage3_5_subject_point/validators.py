@@ -68,6 +68,8 @@ def validate_config(config: dict[str, Any]) -> None:
     quality = int(config["sampling"].get("jpeg_quality", 85))
     if not 1 <= quality <= 100:
         raise ArtifactValidationError("sampling.jpeg_quality 必须在 1..100")
+    if str(config["sampling"].get("decoder", "auto")).lower() not in {"auto", "opencv", "ffmpeg"}:
+        raise ArtifactValidationError("sampling.decoder 只能是 auto、opencv 或 ffmpeg")
 
 
 def validate_points(points: list[dict[str, Any]], intervals: list[dict[str, Any]], metadata: dict[str, Any], sample_fps: float) -> None:

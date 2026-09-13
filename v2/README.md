@@ -220,6 +220,13 @@ python scripts/run_stage3_5.py `
 `requests.jsonl`、`raw_responses.jsonl`、`diagnostics.jsonl` 和 `_SUCCESS.json`。
 请求日志只保存帧号时间线和 JPEG 总字节数，不保存 Base64 图像本体。
 
+若视频携带不完整或异常的色彩元数据（例如视频 97 的 `trc=log316`，但
+`colorspace/primaries=unknown`），新版 FFmpeg/swscale 可能拒绝直接转换 BGR。
+`sampling.decoder: auto` 会在 OpenCV 解码失败后自动使用 FFmpeg 内存管道，并在
+颜色转换前将该异常描述覆盖为 BT.709；整个回退过程同样不会持久化采样帧。排查时
+也可以临时设置 `sampling.decoder: ffmpeg` 强制验证该路径。
+命令行对应参数为 `--decoder ffmpeg`。
+
 未来获得训练好的 TorchScript TCN 权重后，可用 `--backend tcn --checkpoint ...`
 切换到模型推理；默认规则后端不依赖 PyTorch，也不包含训练代码。
 

@@ -153,6 +153,8 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                     metadata["source_path"], planned_frames, fps,
                     jpeg_quality=int(config["sampling"].get("jpeg_quality", 85)),
                     max_side=int(config["sampling"].get("max_side", 1024)),
+                    decoder=str(config["sampling"].get("decoder", "auto")),
+                    ffmpeg_bin=str(config["sampling"].get("ffmpeg_bin", "ffmpeg")),
                 )
                 # 一次性最多输入1帧，降低上下文压力，最主要是降低错误概率，只要模型输出中心坐标即可
                 # 目前保留批次输入的能力，以便后续加速
@@ -190,6 +192,9 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 "visible_point_count": visible_count,
                 "model_omitted_sample_indices": missing_predictions,
                 "error_predictions": error_predictions,
+                "sample_decoder": "skipped" if mode == "passthrough" else (
+                    frames[0].decoder_backend if frames else "none"
+                ),
             })
             # 区间完成即刷新临时目录；若批处理中断，现有内容仍不会被下游当成成功产物。
             write_jsonl(work_dir / "subject_points.jsonl", point_rows)

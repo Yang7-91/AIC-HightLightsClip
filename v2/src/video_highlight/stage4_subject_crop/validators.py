@@ -28,7 +28,7 @@ def list_stage3_5_video_ids(stage3_5_dir: str | Path) -> list[str]:
 
 
 def load_video_inputs(
-    stage1_dir: str | Path, stage3_5_dir: str | Path, video_id: str
+    stage1_dir: str | Path, stage3_5_dir: str | Path, video_id: str,project_paths_config:dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     stage1_video = Path(stage1_dir).resolve() / "videos" / video_id
     stage3_5_video = Path(stage3_5_dir).resolve() / "videos" / video_id
@@ -37,6 +37,9 @@ def load_video_inputs(
     if not (stage3_5_video / "_SUCCESS.json").is_file():
         raise ArtifactValidationError(f"Stage 3.5 视频没有成功标记: {stage3_5_video}")
     metadata = _read_object(stage1_video / "metadata.json")
+    # 当切换环境后，视频路径发生改变，此时默认使用配置文件路径，默认mp4
+    if not Path(metadata["source_path"]).is_file():
+        metadata["source_path"] = str(Path(project_paths_config["video_root"]) / (video_id + ".mp4"))
     scenes = read_jsonl(stage1_video / "scenes.jsonl")
     intervals = read_jsonl(stage3_5_video / "enriched_intervals.jsonl")
     point_rows = read_jsonl(stage3_5_video / "subject_points.jsonl")

@@ -24,6 +24,11 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--video-id", action="append", dest="video_ids")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--sample-fps", type=float)
+    parser.add_argument(
+        "--decoder",
+        choices=["auto", "opencv", "ffmpeg"],
+        help="采样解码器；video 97 等异常色彩元数据可指定 ffmpeg",
+    )
     parser.add_argument("--backend", choices=["openai", "mock"])
     parser.add_argument("--base-url")
     parser.add_argument("--model")
@@ -46,6 +51,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config["runtime"]["backend"] = args.backend
     if args.sample_fps:
         config["sampling"]["fps"] = args.sample_fps
+    if args.decoder:
+        config["sampling"]["decoder"] = args.decoder
     for argument, key in ((args.base_url, "base_url"), (args.model, "model"), (args.api_key, "api_key")):
         if argument is not None:
             config["api"][key] = argument

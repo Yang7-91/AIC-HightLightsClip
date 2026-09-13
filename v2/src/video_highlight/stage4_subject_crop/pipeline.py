@@ -243,6 +243,7 @@ def process_video(
     videos_output_dir: Path,
     tracker: SubjectTracker,
     config: dict[str, Any],
+    project_paths_config:dict[str, Any],
     resume: bool,
     overwrite: bool,
 ) -> dict[str, Any]:
@@ -276,7 +277,7 @@ def process_video(
     # - Stage 1：metadata.json、scenes.jsonl；
     # - Stage 3.5：enriched_intervals.jsonl、subject_points.jsonl。
     # Stage 4 不接收 Stage 3 路径；时间、语义和空间提示均以 Stage 3.5 为唯一契约。
-    metadata, scenes, intervals = load_video_inputs(stage1_dir, stage3_5_dir, video_id)
+    metadata, scenes, intervals = load_video_inputs(stage1_dir, stage3_5_dir, video_id,project_paths_config)
     frame_size = _frame_size(metadata)
     target_ratio = _target_ratio(metadata)
     # 源视频不复制到项目中，直接使用 Stage 1 已持久化的绝对 source_path。
@@ -349,6 +350,7 @@ def run_stage4(
     stage3_5_dir: str | Path,
     output_dir: str | Path,
     config: dict[str, Any],
+    project_paths_config:dict[str, Any],
     video_ids: set[str] | None = None,
     limit: int | None = None,
     resume: bool = False,
@@ -366,6 +368,8 @@ def run_stage4(
         本次 Stage 4 运行目录，其中每个视频写入 ``videos/<video_id>``。
     config:
         已加载的 Stage 4 配置映射。
+    project_paths_config:,
+        项目路径配置
     video_ids:
         可选视频 ID 白名单；``None`` 表示处理 Stage 3.5 中全部成功视频。
     limit:
@@ -413,7 +417,7 @@ def run_stage4(
         if logger:
             logger.info("[%d/%d] Stage 4 处理 video_id=%s", position, len(selected), video_id)
         try:
-            record = process_video(stage1_root, stage3_5_root, video_id, videos_output, tracker, config, resume, overwrite)
+            record = process_video(stage1_root, stage3_5_root, video_id, videos_output, tracker, config, project_paths_config,resume, overwrite)
         except Exception as error:
             # 非 strict 模式把异常转为结构化记录并继续下一视频；traceback 单独保留，
             # 既方便自动汇总，也能在无需复现的情况下定位具体代码路径。

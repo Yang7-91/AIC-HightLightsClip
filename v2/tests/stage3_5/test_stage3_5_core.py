@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from video_highlight.common.atomic_io import write_json, write_jsonl
-from video_highlight.stage3_5_subject_point.frame_sampler import plan_sample_frames
+from video_highlight.stage3_5_subject_point.frame_sampler import _split_mjpeg_stream, plan_sample_frames
 from video_highlight.stage3_5_subject_point.pipeline import run_stage3_5
 from video_highlight.stage3_5_subject_point.response_parser import parse_predictions
 
@@ -35,6 +35,11 @@ class SamplingTests(unittest.TestCase):
 
     def test_sample_rate_above_source_deduplicates_frames(self) -> None:
         self.assertEqual(plan_sample_frames(2, 6, 2.0, 10.0), [2, 3, 4, 5])
+
+    def test_mjpeg_pipe_is_split_without_persistent_frame_files(self) -> None:
+        first = b"\xff\xd8first\xff\xd9"
+        second = b"\xff\xd8second\xff\xd9"
+        self.assertEqual(_split_mjpeg_stream(first + second), [first, second])
 
 
 class ParserTests(unittest.TestCase):

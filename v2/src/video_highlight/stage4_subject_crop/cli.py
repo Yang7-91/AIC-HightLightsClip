@@ -52,6 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.stage3_5_dir,
         output_dir,
         config,
+        paths,
         video_ids=set(args.video_ids) if args.video_ids else None,
         limit=args.limit,
         resume=args.resume,
