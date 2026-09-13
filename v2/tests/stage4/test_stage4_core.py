@@ -14,9 +14,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from video_highlight.common.atomic_io import write_json, write_jsonl
-from video_highlight.stage4_subject_crop.boundary_limiter import finalize_bbox, legal_crop_from_state
+from video_highlight.stage4_subject_crop.boundary_limiter import finalize_bbox, legal_crop_from_state, maximum_crop_width
+from video_highlight.stage4_subject_crop.crop_candidates import generate_crop_candidates
 from video_highlight.stage4_subject_crop.pipeline import run_stage4
 from video_highlight.stage4_subject_crop.pipeline import _planning_spans
+from video_highlight.stage4_subject_crop.sam2_adapter import anchor_windows
+from video_highlight.stage4_subject_crop.subject_tracker import CenterSubjectTracker
 from video_highlight.stage4_subject_crop.trajectory_smoother import smooth_trajectory
 
 
@@ -54,6 +57,52 @@ class GeometryTests(unittest.TestCase):
         ]
         self.assertEqual(_planning_spans(interval, scenes), [(2, 7), (7, 12)])
 
+    def test_fixed_maximum_crop_has_only_one_max_width_candidate(self) -> None:
+        candidates = generate_crop_candidates(
+            [100.0, 100.0, 200.0, 300.0],
+            (1920, 1080),
+            (9, 16),
+            (500.0, 0.0),
+            {"fixed_maximum": True, "scales": [0.55, 0.7], "offsets": [-0.12, 0.12]},
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0][2], maximum_crop_width((1920, 1080), (9, 16)))
+
+    def test_center_backend_interpolates_qwen_points_inside_each_scene(self) -> None:
+        tracker = CenterSubjectTracker({"initial_width_ratio": 0.2, "initial_height_ratio": 0.2})
+        interval = {
+            "start_frame": 0,
+            "end_frame": 12,
+            "subject_points": [
+                {"frame": 0, "subject_point": [0.2, 0.5]},
+                {"frame": 4, "subject_point": [0.6, 0.5]},
+                {"frame": 10, "subject_point": [0.8, 0.5]},
+            ],
+        }
+        scenes = [{"start_frame": 0, "end_frame": 6}, {"start_frame": 6, "end_frame": 12}]
+        points = tracker.track(Path(), interval, (1000, 500), scenes)
+        centers = [(row.subject_box[0] + row.subject_box[2]) * 0.5 for row in points]
+        self.assertAlmostEqual(centers[2], 400.0)
+        # 不允许从第一镜头的末点跨硬切插值到第二镜头的首点。
+        self.assertAlmostEqual(centers[5], 600.0)
+        self.assertAlmostEqual(centers[6], 800.0)
+        self.assertEqual(points[2].source, "qwen_linear")
+
+    def test_sam2_windows_restart_at_every_qwen_anchor(self) -> None:
+        interval = {
+            "start_frame": 10,
+            "end_frame": 30,
+            "subject_points": [
+                {"frame": 12, "subject_point": [0.2, 0.4]},
+                {"frame": 20, "subject_point": [0.7, 0.4]},
+                {"frame": 25, "subject_point": None},
+            ],
+        }
+        windows = anchor_windows(interval, 10, 30)
+        self.assertEqual([(row.start, row.end) for row in windows], [(10, 12), (12, 20), (20, 30)])
+        self.assertEqual(windows[0].point, (0.2, 0.4))
+        self.assertEqual(windows[2].point, (0.7, 0.4))
+
 
 class CenterPipelineTests(unittest.TestCase):
     def test_stage4_consumes_stage1_and_stage3_5_without_stage3(self) -> None:
@@ -69,7 +118,14 @@ class CenterPipelineTests(unittest.TestCase):
             write_jsonl(stage3_5_video / "enriched_intervals.jsonl", [{"video_id": "0", "interval_id": "0_interval_0000", "start_frame": 2, "end_frame": 6, "subject": "dog"}])
             write_jsonl(stage3_5_video / "subject_points.jsonl", [{"video_id": "0", "interval_id": "0_interval_0000", "sample_index": 0, "frame": 2, "subject_point": [0.3, 0.4]}])
             write_json(stage3_5_video / "_SUCCESS.json", {"status": "success"})
-            summary = run_stage4(root / "stage1", root / "stage3_5", root / "stage4", center_config(), strict=True)
+            summary = run_stage4(
+                root / "stage1",
+                root / "stage3_5",
+                root / "stage4",
+                center_config(),
+                {"video_root": str(root)},
+                strict=True,
+            )
             rows = [json.loads(line) for line in (root / "stage4/videos/0/crops.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual([row["frame"] for row in rows], [2, 3, 4, 5])

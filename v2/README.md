@@ -242,6 +242,13 @@ Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_points.jsonl` 
 低代价轨迹，再对中心和尺度做限速平滑。镜头边界两侧分别优化，不跨硬切镜头平滑。
 所有框最后统一取整、再次限界，并输出比赛需要的 `[x, y, w]`。
 
+当前 SAM2 实验路径会先按 Stage 1 镜头边界拆分状态，再把镜头内每个有效 Qwen
+中心点作为相邻窗口的条件帧。锚点 Mask 与 Qwen 点不一致时追加正点提示纠偏；窗口
+缺帧或失败时只对该窗口使用 Qwen 线性插值，不再丢弃整个高光区间的 SAM2 结果。
+`crop_candidates.fixed_maximum: true` 时，输出始终采用目标比例下的最大合法裁剪框，
+只让跟踪结果决定框中心。纯 Qwen 插值轨迹默认跳过单向 EMA，避免平滑滞后使
+`center` 后端偏离 baseline；SAM2 和光流产生的逐帧轨迹仍会执行平滑。
+
 正常运行：
 
 ```powershell
@@ -255,7 +262,8 @@ python scripts/run_stage4.py `
 可选后端：
 
 - `--backend opencv`：默认可运行基线，不需要新权重。
-- `--backend center`：不解码视频的中心最大合法框，用于链路检查或区间失败降级。
+- `--backend center`：不解码视频，按同镜头 Qwen 点线性插值；仅在镜头无有效点时
+  使用固定中心框，也作为其他后端的区间失败降级。
 - `--backend sam2 --sam2-checkpoint <权重路径> --sam2-config <模型配置>`：使用官方
   SAM2 视频预测器传播主体 Mask；只有选择该后端时才加载 SAM2 和 PyTorch。
 

@@ -21,8 +21,17 @@ tracking:
   model_config: configs/sam2.1/sam2.1_hiera_s.yaml
   device: cuda
   amp_dtype: bfloat16
+  # SAM2 严格按 Stage 1 镜头切分状态；每个有效 Qwen 点作为下一窗口的新条件帧。
+  # 锚点 Mask 若离 Qwen 点过远，会追加正点提示纠偏；仍无效则仅回退该锚点窗口。
+  anchor_max_center_distance_ratio: 0.20
+  correction_with_point_prompt: true
+  offload_video_to_cpu: true
+  offload_state_to_cpu: false
+  async_loading_frames: false
 
 crop_candidates:
+  # 固定为目标比例下的最大合法框，只比较主体中心轨迹，避免动态尺度干扰实验。
+  fixed_maximum: true
   scales: [0.55, 0.70, 0.85, 1.0]
   offsets: [-0.12, 0.0, 0.12]
   subject_margins: [0.20, 0.20, 0.15, 0.30]
@@ -39,6 +48,8 @@ optimizer:
   scale_weight: 0.12
 
 smoothing:
+  # 纯 Qwen 线性插值 + 最大框就是 baseline 轨迹，不再叠加会造成滞后的单向 EMA。
+  bypass_for_interpolated_qwen: true
   center_alpha: 0.25
   width_alpha: 0.15
   max_center_step_ratio: 0.04

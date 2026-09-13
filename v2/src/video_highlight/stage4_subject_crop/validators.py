@@ -83,6 +83,15 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ArtifactValidationError(f"Stage 4 配置缺少对象字段: {key}")
     if str(config["runtime"].get("interval_error_policy", "center")) not in {"center", "error"}:
         raise ArtifactValidationError("runtime.interval_error_policy 只能是 center 或 error")
+    fixed_maximum = config["crop_candidates"].get("fixed_maximum", False)
+    if not isinstance(fixed_maximum, bool):
+        raise ArtifactValidationError("crop_candidates.fixed_maximum 必须是布尔值")
+    bypass_interpolated = config["smoothing"].get("bypass_for_interpolated_qwen", True)
+    if not isinstance(bypass_interpolated, bool):
+        raise ArtifactValidationError("smoothing.bypass_for_interpolated_qwen 必须是布尔值")
+    distance = float(config["tracking"].get("anchor_max_center_distance_ratio", 0.20))
+    if not 0.0 <= distance <= 1.0:
+        raise ArtifactValidationError("tracking.anchor_max_center_distance_ratio 必须在 [0,1] 内")
 
 
 def validate_crops(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> None:

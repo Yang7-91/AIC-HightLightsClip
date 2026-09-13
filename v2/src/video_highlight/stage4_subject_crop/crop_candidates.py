@@ -25,6 +25,20 @@ def generate_crop_candidates(
         subject_h * (1.0 + top + bottom) * target_w / target_h,
     )
     max_width = maximum_crop_width(frame_size, target_ratio)
+    # 固定最大框实验只替换主体中心轨迹，不再让掩码面积改变裁剪尺度，也不加入
+    # 运动前视或离散偏移。这样可以公平比较 SAM2 中心与 Qwen 线性插值中心。
+    if bool(config.get("fixed_maximum", False)):
+        center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        return [
+            legal_crop_from_state(
+                center_x,
+                center_y,
+                float(max_width),
+                frame_size,
+                target_ratio,
+            )
+        ]
+
     scales = sorted({float(value) for value in config.get("scales", [0.55, 0.70, 0.85, 1.0])})
     widths = sorted({max(1.0, min(float(max_width), max_width * scale)) for scale in scales if scale > 0.0})
     widths = [value for value in widths if value + 1e-6 >= required_width] or [float(max_width)]

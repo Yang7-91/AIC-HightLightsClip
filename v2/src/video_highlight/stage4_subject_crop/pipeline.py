@@ -10,7 +10,7 @@
 
 对每个 Stage 3.5 区间，处理链路为：
 
-``主体逐帧跟踪 -> 按镜头切分 -> 构图候选生成 -> 构图代价计算``
+``按镜头切分并逐帧跟踪 -> 构图候选生成 -> 构图代价计算``
 ``-> 动态规划选路 -> 时序平滑 -> 整数化与边界校验 -> 持久化``
 
 正式结果写入 ``crops.jsonl``；``tracks.jsonl`` 和 ``diagnostics.jsonl`` 是可解释的
@@ -36,6 +36,7 @@ from video_highlight.contracts.schema_versions import STAGE4_SCHEMA_VERSION
 from .boundary_limiter import finalize_bbox
 from .composition_scorer import composition_cost
 from .crop_candidates import generate_crop_candidates
+from .keyframe_selector import interval_scene_spans
 from .subject_tracker import CenterSubjectTracker, SubjectTracker, TrackPoint, build_subject_tracker
 from .trajectory_optimizer import optimize_trajectory
 from .trajectory_smoother import smooth_trajectory
@@ -133,8 +134,24 @@ def _plan_interval(
 
     # 动态规划从整段角度选择总代价最低的候选序列，避免逐帧独立取最优导致左右跳动。
     optimized = optimize_trajectory(candidates_by_frame, local_costs, config.get("optimizer", {}))
-    # 动态规划输出仍是离散候选；EMA 和最大中心步长限制进一步消除细小抖动。
-    smoothed = smooth_trajectory(optimized, frame_size, target_ratio, config.get("smoothing", {}))
+    # Qwen 锚点的分段线性插值本身已经是连续轨迹。固定最大框实验中若再套单向
+    # EMA，会产生稳定的相位滞后，使 center 后端不再等价于 baseline。因此纯插值/
+    # 中心兜底轨迹默认直接使用唯一最大框候选；SAM2/光流轨迹仍保留平滑。
+    interpolation_sources = {
+        "qwen_anchor",
+        "qwen_linear",
+        "qwen_anchor_hold",
+        "center_fallback",
+    }
+    smoothing_config = config.get("smoothing", {})
+    bypass_interpolated = (
+        bool(config.get("crop_candidates", {}).get("fixed_maximum", False))
+        and bool(smoothing_config.get("bypass_for_interpolated_qwen", True))
+        and all(point.source in interpolation_sources for point in points)
+    )
+    smoothed = optimized if bypass_interpolated else smooth_trajectory(
+        optimized, frame_size, target_ratio, smoothing_config
+    )
 
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
@@ -172,17 +189,7 @@ def _planning_spans(interval: dict[str, Any], scenes: list[dict[str, Any]]) -> l
     因此仅把严格落在高光内部的 ``scene.start_frame`` 作为切点；区间端点无需重复。
     """
 
-    start, end = int(interval["start_frame"]), int(interval["end_frame"])
-    cuts = sorted(
-        {
-            int(scene["start_frame"])
-            for scene in scenes
-            if scene.get("start_frame") is not None and start < int(scene["start_frame"]) < end
-        }
-    )
-    boundaries = [start, *cuts, end]
-    # 两个序列本来就相差一个元素；相邻配对得到 [start, cut)、[cut, end)。
-    return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+    return interval_scene_spans(interval, scenes)
 
 
 def _plan_across_scenes(
@@ -224,16 +231,20 @@ def _plan_across_scenes(
     return crops, tracks, len(spans)
 
 
-def _center_points(interval: dict[str, Any], frame_size: tuple[int, int], tracking_config: dict[str, Any]) -> list[TrackPoint]:
-    """构造覆盖整个区间的中心主体轨迹，作为确定性的最后降级结果。
+def _center_points(
+    interval: dict[str, Any],
+    frame_size: tuple[int, int],
+    tracking_config: dict[str, Any],
+    scenes: list[dict[str, Any]],
+) -> list[TrackPoint]:
+    """构造 Qwen 点线性插值轨迹，无有效点的镜头才使用固定中心。
 
-    CenterSubjectTracker 不读取 ``video_path`` 或镜头列表，所以传入空 Path 和空列表。
-    它仍逐帧生成 TrackPoint，确保后续候选生成、优化、校验和输出流程与正常路径一致，
-    而不是在异常分支中绕开核心数据契约。
+    该降级路径不解码视频，但仍消费镜头边界，避免在硬切两侧对 Qwen 点做错误插值。
+    它逐帧生成 TrackPoint，保证后续构图、平滑、校验和输出与正常路径一致。
     """
 
     tracker = CenterSubjectTracker(tracking_config)
-    return tracker.track(Path(), interval, frame_size, [])
+    return tracker.track(Path(), interval, frame_size, scenes)
 
 
 def process_video(
@@ -309,7 +320,7 @@ def process_video(
                 fallback_count += 1
                 # 降级仍然经过同一套候选、DP、平滑、限界和校验流程，从而保证输出契约
                 # 与正常跟踪路径完全一致。
-                points = _center_points(interval, frame_size, config.get("tracking", {}))
+                points = _center_points(interval, frame_size, config.get("tracking", {}), scenes)
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes(
                     interval, points, scenes, frame_size, target_ratio, config
                 )
@@ -321,8 +332,25 @@ def process_video(
             crops.extend(interval_crops)
             tracks.extend(interval_tracks)
             if status == "tracked":
-                # 平均置信度和镜头子段数量是区间级诊断值，不参与最终比赛输出。
-                diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval["interval_id"], "status": status, "frame_count": len(interval_crops), "planning_span_count": planning_span_count, "mean_track_confidence": sum(point.confidence for point in points) / max(1, len(points))})
+                # 除平均置信度外，显式记录 SAM2 窗口级降级帧数。这样即使接口层仍
+                # 成功返回完整逐帧轨迹，也能判断实际有多少帧来自 Qwen 插值兜底。
+                source_counts: dict[str, int] = {}
+                for point in points:
+                    source_counts[point.source] = source_counts.get(point.source, 0) + 1
+                diagnostics.append({
+                    "schema_version": STAGE4_SCHEMA_VERSION,
+                    "video_id": video_id,
+                    "interval_id": interval["interval_id"],
+                    "status": status,
+                    "frame_count": len(interval_crops),
+                    "planning_span_count": planning_span_count,
+                    "mean_track_confidence": sum(point.confidence for point in points) / max(1, len(points)),
+                    "window_fallback_frame_count": sum(
+                        count for source, count in source_counts.items()
+                        if source.startswith("sam2_window_fallback_")
+                    ),
+                    "track_source_counts": source_counts,
+                })
         # Stage 3.5 保证区间不重叠；这里仍按帧排序并显式拒绝任何重复帧。
         crops.sort(key=lambda row: int(row["frame"]))
         tracks.sort(key=lambda row: int(row["frame"]))

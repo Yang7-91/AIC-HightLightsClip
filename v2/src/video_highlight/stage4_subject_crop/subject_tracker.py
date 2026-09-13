@@ -11,9 +11,9 @@ import numpy as np
 
 from video_highlight.common.exceptions import ArtifactValidationError, ConfigurationError
 
-from .keyframe_selector import reinitialization_frames
+from .keyframe_selector import interval_scene_spans, reinitialization_frames
 from .prompt_generator import subject_point, subject_point_frames
-from .subject_selector import select_subject_box
+from .subject_selector import _clamp_box, select_subject_box
 from .track_monitor import track_is_valid
 
 
@@ -36,18 +36,81 @@ class SubjectTracker(Protocol):
 
 
 class CenterSubjectTracker:
-    """不打开视频的确定性中心主体后端，主要用于降级与链路测试。"""
+    """不解码视频的 Qwen 点线性插值后端，并以固定画面中心作为最终兜底。
+
+    名称保留为 ``center`` 以兼容现有 CLI/config，但行为不再是无条件使用画面
+    中心：同一镜头中只要存在有效 Stage 3.5 点，就在相邻点之间逐帧线性插值；
+    首点之前和末点之后保持最近锚点。只有该镜头完全没有有效点时才使用固定中心。
+    """
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
 
-    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]]) -> list[TrackPoint]:
-        del video_path, scenes
+    @staticmethod
+    def _valid_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in interval.get("subject_points", []):
+            frame = int(row.get("frame", -1))
+            value = row.get("subject_point")
+            if start <= frame < end and isinstance(value, (list, tuple)) and len(value) == 2:
+                rows.append(row)
+        return sorted(rows, key=lambda row: int(row["frame"]))
+
+    def _point_box(self, point: tuple[float, float], frame_size: tuple[int, int]) -> list[float]:
         width, height = frame_size
         box_w = width * float(self.config.get("initial_width_ratio", 0.28))
         box_h = height * float(self.config.get("initial_height_ratio", 0.38))
-        box = [(width - box_w) * 0.5, (height - box_h) * 0.5, (width + box_w) * 0.5, (height + box_h) * 0.5]
-        return [TrackPoint(frame, list(box), 0.0, "center") for frame in range(int(interval["start_frame"]), int(interval["end_frame"]))]
+        center_x, center_y = point[0] * width, point[1] * height
+        return _clamp_box(
+            (
+                center_x - box_w * 0.5,
+                center_y - box_h * 0.5,
+                center_x + box_w * 0.5,
+                center_y + box_h * 0.5,
+            ),
+            width,
+            height,
+        )
+
+    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]]) -> list[TrackPoint]:
+        del video_path
+        output: list[TrackPoint] = []
+        for span_start, span_end in interval_scene_spans(interval, scenes):
+            rows = self._valid_rows(interval, span_start, span_end)
+            if not rows:
+                # 该镜头没有任何可用空间观测时，才退回真正的画面中心。
+                center_box = self._point_box((0.5, 0.5), frame_size)
+                output.extend(
+                    TrackPoint(frame, list(center_box), 0.0, "center_fallback")
+                    for frame in range(span_start, span_end)
+                )
+                continue
+
+            cursor = 0
+            for frame in range(span_start, span_end):
+                while cursor + 1 < len(rows) and int(rows[cursor + 1]["frame"]) <= frame:
+                    cursor += 1
+                left = rows[cursor]
+                left_frame = int(left["frame"])
+                left_point = tuple(float(value) for value in left["subject_point"])
+                if frame < int(rows[0]["frame"]):
+                    point = tuple(float(value) for value in rows[0]["subject_point"])
+                    source = "qwen_anchor_hold"
+                elif cursor + 1 < len(rows):
+                    right = rows[cursor + 1]
+                    right_frame = int(right["frame"])
+                    right_point = tuple(float(value) for value in right["subject_point"])
+                    alpha = (frame - left_frame) / max(1, right_frame - left_frame)
+                    point = (
+                        left_point[0] + alpha * (right_point[0] - left_point[0]),
+                        left_point[1] + alpha * (right_point[1] - left_point[1]),
+                    )
+                    source = "qwen_anchor" if frame == left_frame else "qwen_linear"
+                else:
+                    point = left_point
+                    source = "qwen_anchor" if frame == left_frame else "qwen_anchor_hold"
+                output.append(TrackPoint(frame, self._point_box(point, frame_size), 0.85, source))
+        return output
 
 
 class OpenCVSubjectTracker:
