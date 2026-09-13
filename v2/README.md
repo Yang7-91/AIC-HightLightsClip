@@ -277,6 +277,19 @@ python scripts/run_stage5.py `
 
 `--input-index` 默认取 `configs/paths.yaml` 中的 `input_index`。最终目录包含：
 
+测试单个视频时可指定 `--video-id`。例如下面只读取并生成视频 20 的一行提交
+记录，不要求索引中的其他视频已经产生 Stage 4 结果，也不要求 Stage 1/4 批次级
+`_SUCCESS.json` 已经生成；指定视频自身仍须具有成功标记：
+
+```powershell
+python scripts/run_stage5.py `
+  --stage1-dir runs/full/stage1 `
+  --stage4-dir runs/full/stage4 `
+  --output-dir runs/test_video_20/stage5 `
+  --video-id 20 `
+  --overwrite
+```
+
 ```text
 submission.jsonl       # 可直接提交的最终文件
 validation_report.json # 视频数、预测帧数、空结果数、文件 SHA-256

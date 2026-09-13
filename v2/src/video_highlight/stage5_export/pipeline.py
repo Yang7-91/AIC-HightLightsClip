@@ -62,8 +62,14 @@ def run_stage5(
     config: dict[str, Any],
     overwrite: bool = False,
     logger: Any = None,
+    video_id: str | None = None,
 ) -> dict[str, Any]:
-    """生成、复读并严格校验完整提交文件。"""
+    """生成、复读并严格校验提交文件。
+
+    ``video_id`` 为空时保持比赛正式提交行为，按完整输入索引逐行导出。指定
+    ``video_id`` 时进入单视频测试模式：先从索引中选出唯一对应行，再加载该视频
+    的 Stage 1/4 产物。因此其他视频尚未产生 Stage 4 结果也不会阻塞测试导出。
+    """
 
     _validate_config(config)
     index_path = Path(input_index).resolve()
@@ -93,16 +99,32 @@ def run_stage5(
     _require_stage_success(
         stage1_root,
         "Stage 1",
-        bool(validation_config.get("require_stage1_run_success", True)),
+        video_id is None and bool(validation_config.get("require_stage1_run_success", True)),
     )
     _require_stage_success(
         stage4_root,
         "Stage 4",
-        bool(validation_config.get("require_stage4_run_success", True)),
+        video_id is None and bool(validation_config.get("require_stage4_run_success", True)),
     )
 
-    # 索引顺序从此处一直保持到 JSONL 写出，不按 video_id 重新排序。
-    index_rows = load_input_index(index_path)
+    # 正式模式保持完整索引顺序；测试模式仍以索引为权威来源，只截取指定视频行。
+    all_index_rows = load_input_index(index_path)
+    if video_id is None:
+        index_rows = all_index_rows
+    else:
+        requested_video_id = str(video_id)
+        index_rows = [
+            row for row in all_index_rows
+            if str(row.get("video_id")) == requested_video_id
+        ]
+        if not index_rows:
+            raise ArtifactValidationError(
+                f"--video-id={requested_video_id} 不存在于输入索引: {index_path}"
+            )
+        if len(index_rows) != 1:
+            raise ArtifactValidationError(
+                f"输入索引包含重复 video_id={requested_video_id}，无法单视频导出"
+            )
     metadata_by_id = load_stage1_metadata(
         stage1_root,
         index_rows,
@@ -152,6 +174,8 @@ def run_stage5(
     validation_report = {
         "schema_version": STAGE5_SCHEMA_VERSION,
         "status": "valid",
+        "export_scope": "full_index" if video_id is None else "single_video_test",
+        "video_id_filter": None if video_id is None else str(video_id),
         **file_validation,
         "repaired_bbox_count": repaired_bbox_count,
         "submission_sha256": file_sha256(submission_path),
@@ -163,7 +187,9 @@ def run_stage5(
         "started_at": started_at,
         "finished_at": utc_now_iso(),
         "elapsed_sec": timer.elapsed_sec,
+        "export_scope": "full_index" if video_id is None else "single_video_test",
         "input_index": str(index_path),
+        "video_id_filter": None if video_id is None else str(video_id),
         "stage1_dir": str(stage1_root),
         "stage4_dir": str(stage4_root),
         "submission_path": str(submission_path),

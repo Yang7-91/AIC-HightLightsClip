@@ -22,6 +22,10 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=project_root / "configs/stage5/submission.yaml")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--output-name", help="覆盖配置中的提交文件名，例如 submission.jsonl")
+    parser.add_argument(
+        "--video-id",
+        help="测试模式：只导出索引中指定 video_id 的一行提交记录，例如 20",
+    )
     parser.add_argument("--run-id", default=datetime.now().strftime("stage5_%Y%m%d_%H%M%S"))
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -45,6 +49,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stage4_dir=args.stage4_dir,
         output_dir=output_dir,
         config=config,
+        video_id=args.video_id,
         overwrite=args.overwrite,
         logger=logger,
     )

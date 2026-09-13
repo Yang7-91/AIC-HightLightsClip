@@ -122,6 +122,55 @@ class SubmissionPipelineTests(unittest.TestCase):
         with self.assertRaises(ArtifactValidationError):
             validate_submission_rows(rows, index, metadata)
 
+    def test_video_id_exports_only_requested_index_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(
+                root / "index.json",
+                [
+                    {"video_id": "20", "targetRatioWH": [16, 9]},
+                    {"video_id": "21", "targetRatioWH": [16, 9]},
+                ],
+            )
+            # 单视频测试故意不创建阶段级成功标记，也不准备视频 21。只要视频 20
+            # 自身成功，其他视频或整个批次尚未完成都不应阻塞此次导出。
+            self._prepare_video(
+                root,
+                "20",
+                [{"video_id": "20", "frame": 4, "bboxes": [0, 0, 720]}],
+            )
+            summary = run_stage5(
+                root / "index.json",
+                root / "stage1",
+                root / "stage4",
+                root / "stage5",
+                stage5_config(),
+                video_id="20",
+            )
+            rows = [
+                json.loads(line)
+                for line in (root / "stage5/submission.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual([row["video_id"] for row in rows], ["20"])
+            self.assertEqual(summary["video_count"], 1)
+            self.assertEqual(summary["video_id_filter"], "20")
+
+    def test_video_id_must_exist_in_input_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "index.json", [{"video_id": "20", "targetRatioWH": [16, 9]}])
+            with self.assertRaises(ArtifactValidationError):
+                run_stage5(
+                    root / "index.json",
+                    root / "stage1",
+                    root / "stage4",
+                    root / "stage5",
+                    stage5_config(),
+                    video_id="999",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
