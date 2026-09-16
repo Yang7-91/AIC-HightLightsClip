@@ -19,6 +19,7 @@ from .track_monitor import track_is_valid
 
 @dataclass(frozen=True, slots=True)
 class TrackPoint:
+    """初始的帧级跟踪点，用于后续最终裁剪框计算"""
     frame: int
     subject_box: list[float]
     confidence: float
@@ -32,14 +33,19 @@ class SubjectTracker(Protocol):
         interval: dict[str, Any],
         frame_size: tuple[int, int],
         scenes: list[dict[str, Any]],
-    ) -> list[TrackPoint]: ...
+    ) -> list[TrackPoint]:
+        """
+        Returns:
+            按帧升序排列的list[TrackPoint]
+
+        """
+        ...
 
 
 class CenterSubjectTracker:
     """不解码视频的 Qwen 点线性插值后端，并以固定画面中心作为最终兜底。
 
-    名称保留为 ``center`` 以兼容现有 CLI/config，但行为不再是无条件使用画面
-    中心：同一镜头中只要存在有效 Stage 3.5 点，就在相邻点之间逐帧线性插值；
+    名称保留为 ``center`` 以兼容现有 CLI/config，但行为不再是无条件使用画面中心：同一镜头中只要存在有效 Stage 3.5 点，就在相邻点之间逐帧线性插值；
     首点之前和末点之后保持最近锚点。只有该镜头完全没有有效点时才使用固定中心。
     """
 
@@ -48,6 +54,7 @@ class CenterSubjectTracker:
 
     @staticmethod
     def _valid_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
+        """找出interval里目标的区间帧subject_point并返回一个有序的结果"""
         rows: list[dict[str, Any]] = []
         for row in interval.get("subject_points", []):
             frame = int(row.get("frame", -1))
@@ -88,19 +95,19 @@ class CenterSubjectTracker:
 
             cursor = 0
             for frame in range(span_start, span_end):
-                while cursor + 1 < len(rows) and int(rows[cursor + 1]["frame"]) <= frame:
+                while cursor + 1 < len(rows) and int(rows[cursor + 1]["frame"]) <= frame: # 经典防御性编程，可以跳过重复的rows帧
                     cursor += 1
                 left = rows[cursor]
                 left_frame = int(left["frame"])
                 left_point = tuple(float(value) for value in left["subject_point"])
                 if frame < int(rows[0]["frame"]):
-                    point = tuple(float(value) for value in rows[0]["subject_point"])
+                    point = left_point
                     source = "qwen_anchor_hold"
                 elif cursor + 1 < len(rows):
                     right = rows[cursor + 1]
                     right_frame = int(right["frame"])
                     right_point = tuple(float(value) for value in right["subject_point"])
-                    alpha = (frame - left_frame) / max(1, right_frame - left_frame)
+                    alpha = (frame - left_frame) / max(1, right_frame - left_frame) # 纯线性插值，alpha为区间比值
                     point = (
                         left_point[0] + alpha * (right_point[0] - left_point[0]),
                         left_point[1] + alpha * (right_point[1] - left_point[1]),

@@ -24,12 +24,21 @@ def list_stage3_5_video_ids(stage3_5_dir: str | Path) -> list[str]:
     videos = Path(stage3_5_dir).resolve() / "videos"
     if not videos.is_dir():
         raise ArtifactValidationError(f"Stage 3.5 videos 目录不存在: {videos}")
-    return sorted(row.name for row in videos.iterdir() if row.is_dir() and not row.name.startswith(".") and (row / "_SUCCESS.json").is_file())
+    return sorted((row.name for row in videos.iterdir() if row.is_dir() and not row.name.startswith(".") and (row / "_SUCCESS.json").is_file()),
+                  key=lambda name: int(name) if name.isdigit() else name,) # 保证有序排列
 
 
 def load_video_inputs(
     stage1_dir: str | Path, stage3_5_dir: str | Path, video_id: str,project_paths_config:dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    加载stage4的输入数据，同时进行数据校验。数据校验时，以enriched_intervals.jsonl为准，逐项核对subject_points.jsonl数据合法性
+
+    Returns:
+        metadata: stage1获取的视频的元信息
+        scenes: stage1获取的镜头信息
+        intervals: stage3_5获取的个高光区间的所有采样帧的中心主体预测信息
+    """
     stage1_video = Path(stage1_dir).resolve() / "videos" / video_id
     stage3_5_video = Path(stage3_5_dir).resolve() / "videos" / video_id
     if not (stage1_video / "_SUCCESS.json").is_file():

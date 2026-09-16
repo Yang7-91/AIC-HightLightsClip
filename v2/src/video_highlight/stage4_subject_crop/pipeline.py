@@ -71,7 +71,7 @@ def _target_ratio(metadata: dict[str, Any]) -> tuple[float, float]:
     return ratio
 
 
-def _motion(points: list[TrackPoint], index: int) -> tuple[float, float]:
+def _motion(points: list[TrackPoint], index: int) -> tuple[float, float]: # TODO 可以借鉴类似于adam动量优化器的方法，记录累计运动趋势
     """估计当前主体相对上一帧的中心位移 ``(dx, dy)``。
 
     该位移不是新的跟踪结果，而是构图先验：候选框生成器会沿运动方向预留空间，
@@ -85,9 +85,9 @@ def _motion(points: list[TrackPoint], index: int) -> tuple[float, float]:
     return ((current[0] + current[2] - previous[0] - previous[2]) * 0.5, (current[1] + current[3] - previous[1] - previous[3]) * 0.5)
 
 
-def _plan_interval(
+def _plan_single_scene_span(
     interval: dict[str, Any],
-    points: list[TrackPoint],
+    span_points: list[TrackPoint],
     frame_size: tuple[int, int],
     target_ratio: tuple[float, float],
     config: dict[str, Any],
@@ -99,7 +99,7 @@ def _plan_interval(
     interval:
         Stage 3.5 区间或由 :func:`_plan_across_scenes` 派生出的镜头子区间。帧范围采用
         ``[start_frame, end_frame)`` 左闭右开语义。
-    points:
+    span_points:
         跟踪器输出的逐帧主体框，必须与区间中的每一帧严格一一对应。
     frame_size:
         原视频显示方向的 ``(宽, 高)``。
@@ -118,25 +118,25 @@ def _plan_interval(
     # 动态规划要求每一帧都有一个候选状态集合。先检查跟踪结果是否完整、顺序是否
     # 精确一致；如果在这里容忍缺帧，最终 frame 与 bbox 很容易发生静默错位。
     expected_frames = list(range(int(interval["start_frame"]), int(interval["end_frame"])))
-    if [point.frame for point in points] != expected_frames:
+    if [point.frame for point in span_points] != expected_frames:
         raise ArtifactValidationError(f"主体轨迹没有逐帧覆盖区间: {interval['interval_id']}")
 
     candidates_by_frame: list[list[tuple[float, float, float, float]]] = []
     local_costs: list[list[float]] = []
-    for index, point in enumerate(points):
-        # 每个候选均为浮点 xywh，且已经满足目标比例和画面边界。主体框、当前运动
-        # 方向、多尺度及多偏移共同决定本帧可选的构图状态。
-        candidates = generate_crop_candidates(point.subject_box, frame_size, target_ratio, _motion(points, index), config.get("crop_candidates", {}))
+    for index, point in enumerate(span_points):
+        # 每个候选均为浮点 xywh，且已经满足目标比例和画面边界。
+        # 主体框、当前运动方向、多尺度及多偏移共同决定本帧可选的构图状态。
+        candidates = generate_crop_candidates(point.subject_box, frame_size, target_ratio, _motion(span_points, index), config.get("crop_candidates", {}))
         candidates_by_frame.append(candidates)
         # local_cost 只衡量单帧构图质量，例如主体覆盖、中心性和裁剪尺度；相邻帧
         # 中心/尺度变化的代价由 optimize_trajectory 在状态转移时计算。
         local_costs.append([composition_cost(crop, point.subject_box, frame_size, config.get("composition", {})) for crop in candidates])
 
     # 动态规划从整段角度选择总代价最低的候选序列，避免逐帧独立取最优导致左右跳动。
-    optimized = optimize_trajectory(candidates_by_frame, local_costs, config.get("optimizer", {}))
-    # Qwen 锚点的分段线性插值本身已经是连续轨迹。固定最大框实验中若再套单向
-    # EMA，会产生稳定的相位滞后，使 center 后端不再等价于 baseline。因此纯插值/
-    # 中心兜底轨迹默认直接使用唯一最大框候选；SAM2/光流轨迹仍保留平滑。
+    optimized = optimize_trajectory(candidates_by_frame, local_costs, config.get("optimizer", {})) # TODO 代码有待审查
+    # Qwen 锚点的分段线性插值本身已经是连续轨迹。
+    # 固定最大框实验中若再套单向EMA，会产生稳定的相位滞后，使 center 后端不再等价于 baseline。
+    # 因此纯插值/中心兜底轨迹默认直接使用唯一最大框候选；SAM2/光流轨迹仍保留平滑。
     interpolation_sources = {
         "qwen_anchor",
         "qwen_linear",
@@ -144,10 +144,11 @@ def _plan_interval(
         "center_fallback",
     }
     smoothing_config = config.get("smoothing", {})
+    # 当为center处理且使用最大化框候选时，直接使用optimized候选序列，不再平滑处理
     bypass_interpolated = (
         bool(config.get("crop_candidates", {}).get("fixed_maximum", False))
         and bool(smoothing_config.get("bypass_for_interpolated_qwen", True))
-        and all(point.source in interpolation_sources for point in points)
+        and all(point.source in interpolation_sources for point in span_points)
     )
     smoothed = optimized if bypass_interpolated else smooth_trajectory(
         optimized, frame_size, target_ratio, smoothing_config
@@ -155,7 +156,7 @@ def _plan_interval(
 
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
-    for point, crop in zip(points, smoothed, strict=True):
+    for point, crop in zip(span_points, smoothed, strict=True):
         # finalize_bbox 在浮点限界后统一取整，并在取整后再次限界，输出比赛要求的
         # [x, y, w]。框高不重复保存，由 targetRatioWH 在 Stage 5/评测端推导。
         crops.append({
@@ -192,8 +193,8 @@ def _planning_spans(interval: dict[str, Any], scenes: list[dict[str, Any]]) -> l
     return interval_scene_spans(interval, scenes)
 
 
-def _plan_across_scenes(
-    interval: dict[str, Any],
+def _plan_across_scenes_and_merge_to_interval(
+    interval_with_subject_points: dict[str, Any],
     points: list[TrackPoint],
     scenes: list[dict[str, Any]],
     frame_size: tuple[int, int],
@@ -210,16 +211,16 @@ def _plan_across_scenes(
     内部镜头边界处断开优化。
     """
 
-    interval_start = int(interval["start_frame"])
+    interval_start = int(interval_with_subject_points["start_frame"])
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
-    spans = _planning_spans(interval, scenes)
+    spans = _planning_spans(interval_with_subject_points, scenes)
     for span_start, span_end in spans:
-        # 绝对帧号转换为 points 的零基切片下标。end 保持左闭右开约定。
+        # 绝对帧号转换为 points 列表里的相对索引。end 保持左闭右开约定。
         local_start = span_start - interval_start
         local_end = span_end - interval_start
-        span_interval = {**interval, "start_frame": span_start, "end_frame": span_end}
-        span_crops, span_tracks = _plan_interval(
+        span_interval = {**interval_with_subject_points, "start_frame": span_start, "end_frame": span_end}
+        span_crops, span_tracks = _plan_single_scene_span(
             span_interval,
             points[local_start:local_end],
             frame_size,
@@ -288,7 +289,7 @@ def process_video(
     # - Stage 1：metadata.json、scenes.jsonl；
     # - Stage 3.5：enriched_intervals.jsonl、subject_points.jsonl。
     # Stage 4 不接收 Stage 3 路径；时间、语义和空间提示均以 Stage 3.5 为唯一契约。
-    metadata, scenes, intervals = load_video_inputs(stage1_dir, stage3_5_dir, video_id,project_paths_config)
+    metadata, scenes, intervals_with_subject_points = load_video_inputs(stage1_dir, stage3_5_dir, video_id,project_paths_config)
     frame_size = _frame_size(metadata)
     target_ratio = _target_ratio(metadata)
     # 源视频不复制到项目中，直接使用 Stage 1 已持久化的绝对 source_path。
@@ -303,13 +304,13 @@ def process_video(
 
     # Timer 覆盖实际区间处理和产物校验，不包含最终目录重命名后的批处理汇总。
     with Timer() as timer:
-        for interval in intervals:
+        for interval_with_subject_points in intervals_with_subject_points:
             try:
-                # 正常路径：指定后端（OpenCV/SAM2/center）先产生逐帧主体框，再按
-                # Stage 1 镜头边界独立完成构图优化，禁止跨硬切镜头平滑。
-                points = tracker.track(video_path, interval, frame_size, scenes)
-                interval_crops, interval_tracks, planning_span_count = _plan_across_scenes(
-                    interval, points, scenes, frame_size, target_ratio, config
+                # 正常路径：指定后端（OpenCV/SAM2/center）先产生逐帧主体框，
+                # 再按Stage 1 镜头边界独立完成构图优化，禁止跨硬切镜头平滑。
+                points = tracker.track(video_path, interval_with_subject_points, frame_size, scenes)
+                interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
+                    interval_with_subject_points, points, scenes, frame_size, target_ratio, config
                 )
                 status = "tracked"
             except Exception as error:
@@ -320,13 +321,13 @@ def process_video(
                 fallback_count += 1
                 # 降级仍然经过同一套候选、DP、平滑、限界和校验流程，从而保证输出契约
                 # 与正常跟踪路径完全一致。
-                points = _center_points(interval, frame_size, config.get("tracking", {}), scenes)
-                interval_crops, interval_tracks, planning_span_count = _plan_across_scenes(
-                    interval, points, scenes, frame_size, target_ratio, config
+                points = _center_points(interval_with_subject_points, frame_size, config.get("tracking", {}), scenes)
+                interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
+                    interval_with_subject_points, points, scenes, frame_size, target_ratio, config
                 )
                 status = "center_fallback"
                 # 保存异常类型和消息但不中断本视频，方便后续统计哪些区间曾经降级。
-                diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
+                diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval_with_subject_points["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
 
             # 每个 Stage 3.5 区间不会与其他区间重叠；先累积，循环结束后统一排序校验。
             crops.extend(interval_crops)
@@ -340,7 +341,7 @@ def process_video(
                 diagnostics.append({
                     "schema_version": STAGE4_SCHEMA_VERSION,
                     "video_id": video_id,
-                    "interval_id": interval["interval_id"],
+                    "interval_id": interval_with_subject_points["interval_id"],
                     "status": status,
                     "frame_count": len(interval_crops),
                     "planning_span_count": planning_span_count,
@@ -366,7 +367,7 @@ def process_video(
         validation = validate_stage4_artifacts(work_dir)
 
     # _SUCCESS.json 必须最后写入。它既是下游可消费标记，也是 --resume 的判定依据。
-    success = success_record(video_id, elapsed_sec=timer.elapsed_sec, backend=config["tracking"].get("backend", "opencv"), interval_count=len(intervals), prediction_frame_count=len(crops), fallback_count=fallback_count, validation=validation)
+    success = success_record(video_id, elapsed_sec=timer.elapsed_sec, backend=config["tracking"].get("backend", "opencv"), interval_count=len(intervals_with_subject_points), prediction_frame_count=len(crops), fallback_count=fallback_count, validation=validation)
     write_json(work_dir / "_SUCCESS.json", success)
     # 同一文件系统内目录重命名把已验证的工作目录一次性提交为正式视频产物。
     work_dir.rename(final_dir)

@@ -12,6 +12,9 @@ def interval_scene_spans(
 
     跟踪和构图必须使用同一组边界。把切分逻辑放在这里，可以避免出现“构图已经
     按镜头重置，但跟踪状态仍跨镜头传播”的隐蔽错误。
+
+    Returns:
+        根据硬镜头镜头边界切割后的帧区间元组
     """
 
     start, end = int(interval["start_frame"]), int(interval["end_frame"])
@@ -20,7 +23,7 @@ def interval_scene_spans(
             int(scene["start_frame"])
             for scene in scenes
             if scene.get("start_frame") is not None
-            and start < int(scene["start_frame"]) < end
+            and start < int(scene["start_frame"]) < end # 查看高光区间里有多少个镜头起始点，这些镜头起始点就是边界
         }
     )
     boundaries = [start, *cuts, end]

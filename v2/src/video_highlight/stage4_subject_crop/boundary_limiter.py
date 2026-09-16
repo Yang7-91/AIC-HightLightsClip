@@ -26,6 +26,7 @@ def legal_crop_from_state(
     max_width = maximum_crop_width(frame_size, target_ratio)
     width = max(1.0, min(float(max_width), float(crop_width)))
     height = width * target_h / target_w
+    # 坐标不能位于负轴
     x = max(0.0, min(float(frame_w) - width, float(center_x) - width * 0.5))
     y = max(0.0, min(float(frame_h) - height, float(center_y) - height * 0.5))
     return x, y, width, height

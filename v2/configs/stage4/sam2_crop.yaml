@@ -34,6 +34,7 @@ crop_candidates:
   fixed_maximum: true
   scales: [0.55, 0.70, 0.85, 1.0]
   offsets: [-0.12, 0.0, 0.12]
+  # 裁剪内边距占裁剪框比例
   subject_margins: [0.20, 0.20, 0.15, 0.30]
   motion_look_ahead: 2.0
 
@@ -49,7 +50,9 @@ optimizer:
 
 smoothing:
   # 纯 Qwen 线性插值 + 最大框就是 baseline 轨迹，不再叠加会造成滞后的单向 EMA。
+  # bypass_for_interpolated_qwen为true时，表示原始 baseline 轨迹不使用EMA平滑
   bypass_for_interpolated_qwen: true
+  # 中心 EMA 系数，默认 0.25，越小越平滑。
   center_alpha: 0.25
   width_alpha: 0.15
   max_center_step_ratio: 0.04
