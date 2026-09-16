@@ -33,6 +33,7 @@ class SubjectTracker(Protocol):
         interval: dict[str, Any],
         frame_size: tuple[int, int],
         scenes: list[dict[str, Any]],
+        visualization_dir: Path | None = None,
     ) -> list[TrackPoint]:
         """
         Returns:
@@ -79,8 +80,8 @@ class CenterSubjectTracker:
             height,
         )
 
-    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]]) -> list[TrackPoint]:
-        del video_path
+    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]], visualization_dir: Path | None = None) -> list[TrackPoint]:
+        del video_path, visualization_dir
         output: list[TrackPoint] = []
         for span_start, span_end in interval_scene_spans(interval, scenes):
             rows = self._valid_rows(interval, span_start, span_end)
@@ -131,7 +132,8 @@ class OpenCVSubjectTracker:
         mask[max(0, y1):min(gray.shape[0], y2), max(0, x1):min(gray.shape[1], x2)] = 255
         return cv2.goodFeaturesToTrack(gray, mask=mask, maxCorners=maximum, qualityLevel=0.01, minDistance=5, blockSize=7)
 
-    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]]) -> list[TrackPoint]:
+    def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]], visualization_dir: Path | None = None) -> list[TrackPoint]:
+        del visualization_dir
         if not video_path.is_file():
             raise ArtifactValidationError(f"源视频不存在: {video_path}")
         start, end = int(interval["start_frame"]), int(interval["end_frame"])
@@ -189,7 +191,7 @@ class OpenCVSubjectTracker:
         return output
 
 
-def build_subject_tracker(config: dict[str, Any]) -> SubjectTracker:
+def build_subject_tracker(config: dict[str, Any], visualization_config: dict[str, Any] | None = None) -> SubjectTracker:
     backend = str(config.get("backend", "opencv")).lower()
     if backend == "opencv":
         return OpenCVSubjectTracker(config)
@@ -197,5 +199,5 @@ def build_subject_tracker(config: dict[str, Any]) -> SubjectTracker:
         return CenterSubjectTracker(config)
     if backend == "sam2":
         from .sam2_adapter import SAM2SubjectTracker
-        return SAM2SubjectTracker(config)
+        return SAM2SubjectTracker(config, visualization_config or {})
     raise ConfigurationError(f"未知 Stage 4 tracking.backend: {backend}")

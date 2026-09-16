@@ -4,6 +4,16 @@ runtime:
   # center: 单个区间跟踪失败时仍输出合法的最大中心构图；error: 直接失败。
   interval_error_policy: center
 
+visualization:
+  # 只控制调试产物的采样，不改变 SAM2 的逐帧传播频率。
+  enabled: true
+  sample_fps: 6.0
+  always_save_anchor_frames: true
+  always_save_fallback_frames: true
+  mask_alpha: 0.35
+  save_images: true
+  write_video: false
+
 tracking:
   # 默认 OpenCV 后端无需新模型。可通过 CLI 切换 center 或 sam2。
   backend: opencv

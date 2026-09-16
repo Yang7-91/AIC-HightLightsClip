@@ -15,6 +15,7 @@ import numpy as np
 from video_highlight.common.exceptions import ArtifactValidationError, ConfigurationError
 
 from .keyframe_selector import interval_scene_spans
+from .propagation_visualizer import PropagationVisualizer, VisualizationError
 from .subject_selector import select_subject_box
 from .subject_tracker import CenterSubjectTracker, TrackPoint
 
@@ -79,7 +80,7 @@ def anchor_windows(
 class SAM2SubjectTracker:
     """在单镜头状态内按相邻 Qwen 锚点窗口执行 SAM2 单向传播。"""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], visualization_config: dict[str, Any] | None = None) -> None:
         checkpoint = Path(str(config.get("checkpoint", "")))
         model_config = str(config.get("model_config", ""))
         if not checkpoint.is_file() or not model_config:
@@ -94,6 +95,7 @@ class SAM2SubjectTracker:
         self.amp_dtype = str(config.get("amp_dtype", "bfloat16"))
         self.predictor = build_sam2_video_predictor(model_config, str(checkpoint), device=self.device)
         self.config = config
+        self.visualization_config = visualization_config or {}
 
     def _contexts(self) -> ExitStack:
         stack = ExitStack()
@@ -122,20 +124,27 @@ class SAM2SubjectTracker:
         finally:
             capture.release()
 
+    @staticmethod
+    def _logits_to_mask(logits: Any, frame_size: tuple[int, int]) -> np.ndarray:
+        """把 GPU logits 一次性转换为与显示画面尺寸一致的二值 Mask。"""
+
+        mask = (logits[0].detach().float().cpu().numpy().squeeze() > 0).astype(np.uint8)
+        frame_width, frame_height = frame_size
+        if mask.shape != (frame_height, frame_width):
+            mask = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+        return mask
+
     def _mask_track_point(
         self,
         absolute_frame: int,
-        logits: Any,
+        mask: np.ndarray,
         frame_size: tuple[int, int],
         prompt_point: tuple[float, float] | None,
         source: str,
     ) -> TrackPoint | None:
         """把 SAM2 logits 转为主体框；锚点帧优先选择包含 Qwen 点的连通域。"""
 
-        mask = (logits[0].detach().float().cpu().numpy().squeeze() > 0).astype(np.uint8)
         frame_width, frame_height = frame_size
-        if mask.shape != (frame_height, frame_width):
-            mask = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         if count <= 1:
             return None
@@ -192,9 +201,8 @@ class SAM2SubjectTracker:
             obj_id=1,
             box=np.asarray(anchor_box, dtype=np.float32),
         )
-        prediction = self._mask_track_point(
-            absolute_frame, logits, frame_size, point, "sam2_anchor_box"
-        )
+        mask = self._logits_to_mask(logits, frame_size)
+        prediction = self._mask_track_point(absolute_frame, mask, frame_size, point, "sam2_anchor_box")
         if self._anchor_is_valid(prediction, point, frame_size):
             return prediction
         if point is not None and bool(self.config.get("correction_with_point_prompt", True)):
@@ -209,9 +217,8 @@ class SAM2SubjectTracker:
                 labels=labels,
                 clear_old_points=False,
             )
-            prediction = self._mask_track_point(
-                absolute_frame, logits, frame_size, point, "sam2_anchor_corrected"
-            )
+            mask = self._logits_to_mask(logits, frame_size)
+            prediction = self._mask_track_point(absolute_frame, mask, frame_size, point, "sam2_anchor_corrected")
             if self._anchor_is_valid(prediction, point, frame_size):
                 return prediction
         raise RuntimeError(f"SAM2 锚点 Mask 未通过 Qwen 中心校验: frame={absolute_frame}")
@@ -235,12 +242,28 @@ class SAM2SubjectTracker:
         span_start: int,
         span_end: int,
         fallback_by_frame: dict[int, TrackPoint],
+        visualization_dir: Path | None,
+        source_fps: float,
+        scene_index: int,
     ) -> list[TrackPoint]:
         """在一个 SAM2 状态内依次处理相邻锚点窗口，绝不跨镜头复用记忆。"""
 
         with tempfile.TemporaryDirectory(prefix="stage4-sam2-scene-") as directory_name:
             directory = Path(directory_name)
             self._write_scene_frames(video_path, span_start, span_end, directory)
+            scene_visualization_dir = None
+            if visualization_dir is not None:
+                scene_visualization_dir = (
+                    visualization_dir
+                    / str(interval["interval_id"])
+                    / f"scene_{scene_index:03d}_{span_start}_{span_end}"
+                )
+            visualizer = PropagationVisualizer(
+                self.visualization_config,
+                scene_visualization_dir,
+                source_fps,
+                span_start,
+            )
             state = self.predictor.init_state(
                 video_path=str(directory),
                 offload_video_to_cpu=bool(self.config.get("offload_video_to_cpu", True)),
@@ -248,6 +271,28 @@ class SAM2SubjectTracker:
                 async_loading_frames=bool(self.config.get("async_loading_frames", False)),
             )
             results: dict[int, TrackPoint] = {}
+
+            def apply_fallback(window: AnchorWindow, only_frame: int | None = None) -> None:
+                """写入窗口级回退结果，并按配置保存没有 Mask 的诊断图。"""
+
+                frame_range = (
+                    range(only_frame, only_frame + 1)
+                    if only_frame is not None
+                    else range(window.start, window.end)
+                )
+                for frame_index in frame_range:
+                    prediction = self._fallback_point(fallback_by_frame[frame_index])
+                    results[frame_index] = prediction
+                    is_anchor = frame_index == window.start and window.is_qwen_anchor
+                    visualizer.save(
+                        frame_index,
+                        directory / f"{frame_index - span_start:06d}.jpg",
+                        prediction,
+                        qwen_point=window.point if frame_index == window.start else None,
+                        is_anchor=is_anchor,
+                        is_fallback=True,
+                    )
+
             try:
                 with self._contexts():
                     for window in anchor_windows(interval, span_start, span_end):
@@ -255,8 +300,7 @@ class SAM2SubjectTracker:
                         frame = cv2.imread(str(directory / f"{local_start:06d}.jpg"))
                         if frame is None:
                             # 只降级当前窗口；下一 Qwen 锚点仍有机会恢复 SAM2。
-                            for frame_index in range(window.start, window.end):
-                                results[frame_index] = self._fallback_point(fallback_by_frame[frame_index])
+                            apply_fallback(window)
                             continue
                         try:
                             self._add_anchor_prompt(
@@ -279,28 +323,50 @@ class SAM2SubjectTracker:
                                 if not window.start <= absolute_frame < window.end:
                                     continue
                                 prompt = window.point if absolute_frame == window.start else None
+                                mask = self._logits_to_mask(logits, frame_size)
                                 prediction = self._mask_track_point(
                                     absolute_frame,
-                                    logits,
+                                    mask,
                                     frame_size,
                                     prompt,
                                     "sam2_anchor" if absolute_frame == window.start else "sam2_propagated",
                                 )
                                 if prediction is not None:
                                     results[absolute_frame] = prediction
+                                    is_anchor = absolute_frame == window.start and window.is_qwen_anchor
+                                    prompt_box = None
+                                    if absolute_frame == window.start:
+                                        prompt_frame = frame
+                                        prompt_box, _, _ = select_subject_box(
+                                            prompt_frame, window.point, self.config
+                                        )
+                                    visualizer.save(
+                                        absolute_frame,
+                                        directory / f"{int(local_frame):06d}.jpg",
+                                        prediction,
+                                        mask=mask,
+                                        qwen_point=window.point if absolute_frame == window.start else None,
+                                        prompt_box=prompt_box,
+                                        is_anchor=is_anchor,
+                                        is_fallback=False,
+                                    )
+                        except VisualizationError:
+                            # 调试产物失败不能伪装成跟踪失败，否则会把正确的 SAM2
+                            # 结果替换为 Qwen 回退，同时再次写图并掩盖真正原因。
+                            raise
                         except Exception:
                             # CUDA/Mask/锚点异常的影响限制在当前相邻锚点窗口。已经成功的
                             # 镜头帧保留，下一锚点仍会重新输入 Qwen 观测进行纠偏。
-                            for frame_index in range(window.start, window.end):
-                                results[frame_index] = self._fallback_point(fallback_by_frame[frame_index])
+                            apply_fallback(window)
                             continue
                         # SAM2 偶发不返回某一帧 Mask 时只补该帧，而非令整个区间回退。
                         for frame_index in range(window.start, window.end):
                             if frame_index not in results:
-                                results[frame_index] = self._fallback_point(fallback_by_frame[frame_index])
+                                apply_fallback(window, only_frame=frame_index)
             finally:
                 if hasattr(self.predictor, "reset_state"):
                     self.predictor.reset_state(state)
+                visualizer.close()
             return [results[frame] for frame in range(span_start, span_end)]
 
     def track(
@@ -309,6 +375,7 @@ class SAM2SubjectTracker:
         interval: dict[str, Any],
         frame_size: tuple[int, int],
         scenes: list[dict[str, Any]],
+        visualization_dir: Path | None = None,
     ) -> list[TrackPoint]:
         if not video_path.is_file():
             raise ArtifactValidationError(f"源视频不存在: {video_path}")
@@ -317,8 +384,11 @@ class SAM2SubjectTracker:
             Path(), interval, frame_size, scenes
         )
         fallback_by_frame = {point.frame: point for point in fallback}
+        capture = cv2.VideoCapture(str(video_path))
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS)) if capture.isOpened() else 0.0
+        capture.release()
         output: list[TrackPoint] = []
-        for span_start, span_end in interval_scene_spans(interval, scenes):
+        for scene_index, (span_start, span_end) in enumerate(interval_scene_spans(interval, scenes)):
             output.extend(
                 self._track_scene(
                     video_path,
@@ -327,6 +397,9 @@ class SAM2SubjectTracker:
                     span_start,
                     span_end,
                     fallback_by_frame,
+                    visualization_dir,
+                    source_fps,
+                    scene_index,
                 )
             )
         expected = list(range(int(interval["start_frame"]), int(interval["end_frame"])))

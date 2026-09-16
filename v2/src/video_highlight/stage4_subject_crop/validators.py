@@ -101,6 +101,24 @@ def validate_config(config: dict[str, Any]) -> None:
     distance = float(config["tracking"].get("anchor_max_center_distance_ratio", 0.20))
     if not 0.0 <= distance <= 1.0:
         raise ArtifactValidationError("tracking.anchor_max_center_distance_ratio 必须在 [0,1] 内")
+    visualization = config.get("visualization", {})
+    if not isinstance(visualization, dict):
+        raise ArtifactValidationError("visualization 必须是对象")
+    for key, default in (
+        ("enabled", False),
+        ("always_save_anchor_frames", True),
+        ("always_save_fallback_frames", True),
+        ("save_images", True),
+        ("write_video", False),
+    ):
+        if not isinstance(visualization.get(key, default), bool):
+            raise ArtifactValidationError(f"visualization.{key} 必须是布尔值")
+    sample_fps = float(visualization.get("sample_fps", 2.0))
+    if not math.isfinite(sample_fps) or sample_fps <= 0:
+        raise ArtifactValidationError("visualization.sample_fps 必须是正有限数")
+    mask_alpha = float(visualization.get("mask_alpha", 0.35))
+    if not math.isfinite(mask_alpha) or not 0.0 <= mask_alpha <= 1.0:
+        raise ArtifactValidationError("visualization.mask_alpha 必须在 [0,1] 内")
 
 
 def validate_crops(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> None:

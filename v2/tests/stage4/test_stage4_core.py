@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import cv2
+import numpy as np
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ from video_highlight.stage4_subject_crop.boundary_limiter import finalize_bbox, 
 from video_highlight.stage4_subject_crop.crop_candidates import generate_crop_candidates
 from video_highlight.stage4_subject_crop.pipeline import run_stage4
 from video_highlight.stage4_subject_crop.pipeline import _planning_spans
+from video_highlight.stage4_subject_crop.propagation_visualizer import PropagationVisualizer
 from video_highlight.stage4_subject_crop.sam2_adapter import anchor_windows
 from video_highlight.stage4_subject_crop.subject_tracker import CenterSubjectTracker
 from video_highlight.stage4_subject_crop.trajectory_smoother import smooth_trajectory
@@ -35,6 +38,55 @@ def center_config() -> dict:
 
 
 class GeometryTests(unittest.TestCase):
+    def test_visualization_sampling_and_forced_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            visualizer = PropagationVisualizer(
+                {
+                    "enabled": True,
+                    "sample_fps": 2.0,
+                    "always_save_anchor_frames": True,
+                    "always_save_fallback_frames": True,
+                    "save_images": True,
+                    "write_video": False,
+                },
+                Path(temp),
+                source_fps=30.0,
+                span_start=100,
+            )
+            self.assertTrue(visualizer.should_save(100, is_anchor=False, is_fallback=False))
+            self.assertFalse(visualizer.should_save(114, is_anchor=False, is_fallback=False))
+            self.assertTrue(visualizer.should_save(115, is_anchor=False, is_fallback=False))
+            self.assertTrue(visualizer.should_save(107, is_anchor=True, is_fallback=False))
+            self.assertTrue(visualizer.should_save(108, is_anchor=False, is_fallback=True))
+
+    def test_disabled_visualization_does_not_create_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "disabled"
+            visualizer = PropagationVisualizer(
+                {"enabled": False, "sample_fps": 2.0}, target, 30.0, 0
+            )
+            self.assertFalse(visualizer.active)
+            self.assertFalse(target.exists())
+
+    def test_visualization_writes_to_unicode_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "中文目录"
+            source = root / "source.jpg"
+            root.mkdir(parents=True)
+            ok, encoded = cv2.imencode(".jpg", np.zeros((80, 120, 3), dtype=np.uint8))
+            self.assertTrue(ok)
+            encoded.tofile(str(source))
+            output = root / "输出"
+            visualizer = PropagationVisualizer(
+                {"enabled": True, "sample_fps": 2.0, "save_images": True, "write_video": False},
+                output,
+                30.0,
+                0,
+            )
+            from video_highlight.stage4_subject_crop.subject_tracker import TrackPoint
+            visualizer.save(0, source, TrackPoint(0, [10.0, 10.0, 50.0, 60.0], 0.8, "sam2_anchor"), is_anchor=True)
+            self.assertTrue((output / "frame_000000.jpg").is_file())
+
     def test_portrait_crop_is_legal_after_integer_rounding(self) -> None:
         crop = legal_crop_from_state(5_000, -100, 5_000, (1920, 1080), (9, 16))
         x, y, width = finalize_bbox(crop, (1920, 1080), (9, 16))

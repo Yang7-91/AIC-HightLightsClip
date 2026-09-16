@@ -249,6 +249,12 @@ Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_points.jsonl` 
 只让跟踪结果决定框中心。纯 Qwen 插值轨迹默认跳过单向 EMA，避免平滑滞后使
 `center` 后端偏离 baseline；SAM2 和光流产生的逐帧轨迹仍会执行平滑。
 
+将 `visualization.enabled` 设置为 `true` 后，SAM2 仍逐帧传播，但只按
+`visualization.sample_fps` 保存叠加了真实 Mask、主体框、预测中心与 Qwen 锚点的
+调试图。锚点帧和窗口回退帧可配置为强制保存；结果位于单视频目录下的
+`visualizations/<interval_id>/scene_*/`。`save_images` 和 `write_video` 分别控制 JPG
+与每镜头 `propagation.mp4`，两者均关闭时不会创建可视化目录。
+
 正常运行：
 
 ```powershell

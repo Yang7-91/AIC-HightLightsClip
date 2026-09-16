@@ -308,7 +308,13 @@ def process_video(
             try:
                 # 正常路径：指定后端（OpenCV/SAM2/center）先产生逐帧主体框，
                 # 再按Stage 1 镜头边界独立完成构图优化，禁止跨硬切镜头平滑。
-                points = tracker.track(video_path, interval_with_subject_points, frame_size, scenes)
+                points = tracker.track(
+                    video_path,
+                    interval_with_subject_points,
+                    frame_size,
+                    scenes,
+                    work_dir / "visualizations",
+                )
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
                     interval_with_subject_points, points, scenes, frame_size, target_ratio, config
                 )
@@ -435,7 +441,7 @@ def run_stage4(
         raise ArtifactValidationError("筛选后没有可处理的 Stage 3.5 视频")
 
     # 跟踪器通常包含模型或后端状态，整批只构造一次，避免逐视频重复加载 SAM2 权重。
-    tracker = build_subject_tracker(config["tracking"])
+    tracker = build_subject_tracker(config["tracking"], config.get("visualization", {}))
     # 配置哈希与解析后的配置一起持久化，便于确认不同实验是否真正使用同一参数。
     run_info = {"schema_version": STAGE4_SCHEMA_VERSION, "started_at": utc_now_iso(), "stage1_dir": str(stage1_root), "stage3_5_dir": str(stage3_5_root), "tracking_backend": config["tracking"].get("backend", "opencv"), "config_sha256": mapping_sha256(config), "selected_video_count": len(selected)}
     write_json(stage4_root / "resolved_config.json", deepcopy(config))
