@@ -1,17 +1,17 @@
-schema_version: stage3.5.v1
+schema_version: stage3.5.v2
 
 api:
   base_url: "http://172.25.254.120:8000/v1"
   api_key: "EMPTY"
   model: "QuantTrio/Qwen3.5-4B-AWQ"
-  timeout_sec: 300.0
+  timeout_sec: 30.0
   max_retries: 2
   healthcheck_on_start: true
 
 generation:
   temperature: 0.0
   top_p: 0.9
-  max_tokens: 1024
+  max_tokens: 2048
   extra_body:
     chat_template_kwargs:
       enable_thinking: false

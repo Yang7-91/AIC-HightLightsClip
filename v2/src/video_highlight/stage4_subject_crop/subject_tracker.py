@@ -12,7 +12,7 @@ import numpy as np
 from video_highlight.common.exceptions import ArtifactValidationError, ConfigurationError
 
 from .keyframe_selector import interval_scene_spans, reinitialization_frames
-from .prompt_generator import subject_point, subject_point_frames
+from .prompt_generator import observation_points, subject_observations, subject_point, subject_point_frames
 from .subject_selector import _clamp_box, select_subject_box
 from .track_monitor import track_is_valid
 
@@ -24,6 +24,8 @@ class TrackPoint:
     subject_box: list[float]
     confidence: float
     source: str
+    object_count: int = 1
+    object_ids: tuple[int, ...] = ()
 
 
 class SubjectTracker(Protocol):
@@ -55,14 +57,11 @@ class CenterSubjectTracker:
 
     @staticmethod
     def _valid_rows(interval: dict[str, Any], start: int, end: int) -> list[dict[str, Any]]:
-        """找出interval里目标的区间帧subject_point并返回一个有序的结果"""
-        rows: list[dict[str, Any]] = []
-        for row in interval.get("subject_points", []):
-            frame = int(row.get("frame", -1))
-            value = row.get("subject_point")
-            if start <= frame < end and isinstance(value, (list, tuple)) and len(value) == 2:
-                rows.append(row)
-        return sorted(rows, key=lambda row: int(row["frame"]))
+        """找出镜头内至少含一个有效目标点的观察。"""
+        return [
+            row for row in subject_observations(interval)
+            if start <= int(row.get("frame", -1)) < end and observation_points(row)
+        ]
 
     def _point_box(self, point: tuple[float, float], frame_size: tuple[int, int]) -> list[float]:
         width, height = frame_size
@@ -79,6 +78,17 @@ class CenterSubjectTracker:
             width,
             height,
         )
+
+    def _observation_box(self, row: dict[str, Any], frame_size: tuple[int, int]) -> list[float]:
+        boxes = [self._point_box(point, frame_size) for point in observation_points(row)]
+        if not boxes:
+            return self._point_box((0.5, 0.5), frame_size)
+        return [
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ]
 
     def track(self, video_path: Path, interval: dict[str, Any], frame_size: tuple[int, int], scenes: list[dict[str, Any]], visualization_dir: Path | None = None) -> list[TrackPoint]:
         del video_path, visualization_dir
@@ -100,24 +110,31 @@ class CenterSubjectTracker:
                     cursor += 1
                 left = rows[cursor]
                 left_frame = int(left["frame"])
-                left_point = tuple(float(value) for value in left["subject_point"])
+                left_box = self._observation_box(left, frame_size)
                 if frame < int(rows[0]["frame"]):
-                    point = left_point
+                    box = left_box
                     source = "qwen_anchor_hold"
                 elif cursor + 1 < len(rows):
                     right = rows[cursor + 1]
                     right_frame = int(right["frame"])
-                    right_point = tuple(float(value) for value in right["subject_point"])
+                    right_box = self._observation_box(right, frame_size)
                     alpha = (frame - left_frame) / max(1, right_frame - left_frame) # 纯线性插值，alpha为区间比值
-                    point = (
-                        left_point[0] + alpha * (right_point[0] - left_point[0]),
-                        left_point[1] + alpha * (right_point[1] - left_point[1]),
-                    )
+                    box = [
+                        left_box[index] + alpha * (right_box[index] - left_box[index])
+                        for index in range(4)
+                    ]
                     source = "qwen_anchor" if frame == left_frame else "qwen_linear"
                 else:
-                    point = left_point
+                    box = left_box
                     source = "qwen_anchor" if frame == left_frame else "qwen_anchor_hold"
-                output.append(TrackPoint(frame, self._point_box(point, frame_size), 0.85, source))
+                confidence = max(
+                    (float(target.get("confidence", 0.0)) for target in left.get("targets", [])),
+                    default=0.85,
+                )
+                output.append(TrackPoint(
+                    frame, list(box), confidence, source,
+                    max(1, len(observation_points(left))), ()
+                ))
         return output
 
 

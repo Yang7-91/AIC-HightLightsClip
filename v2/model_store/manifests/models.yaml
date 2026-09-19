@@ -1,1 +1,8 @@
-# 本地模型名称、来源、版本、哈希和路径清单占位。
+models:
+  sam2.1_hiera_small:
+    path: model_store/sam2/sam2.1_hiera_small.pt
+    source: facebook/sam2.1-hiera-small
+  grounding_dino_tiny:
+    path: model_store/grounding-dino-tiny
+    source: IDEA-Research/grounding-dino-tiny
+    format: huggingface_directory

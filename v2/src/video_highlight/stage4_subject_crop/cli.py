@@ -26,6 +26,8 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=["opencv", "center", "sam2"])
     parser.add_argument("--sam2-checkpoint", type=Path)
     parser.add_argument("--sam2-config")
+    parser.add_argument("--grounding-model", type=Path)
+    parser.add_argument("--no-grounding", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true")
@@ -44,6 +46,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         config["tracking"]["checkpoint"] = str(args.sam2_checkpoint.resolve())
     if args.sam2_config:
         config["tracking"]["model_config"] = args.sam2_config
+    if args.grounding_model:
+        config["tracking"].setdefault("grounding", {})["model"] = str(args.grounding_model.resolve())
+    if args.no_grounding:
+        config["tracking"].setdefault("grounding", {})["enabled"] = False
     runs_root = resolve_path(paths.get("runs_root", "runs"), project_root)
     output_dir = args.output_dir or (runs_root / args.run_id / "stage4")
     logger = configure_logging(Path(output_dir) / "stage4.log", verbose=args.verbose)

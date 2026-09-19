@@ -33,7 +33,7 @@ def build_parser(project_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--base-url")
     parser.add_argument("--model")
     parser.add_argument("--api-key")
-    parser.add_argument("--skip-processing", "--passthrough", action="store_true", help="不解码、不调用模型，输出同一采样时间轴上的 null 主体点")
+    parser.add_argument("--skip-processing", "--passthrough", action="store_true", help="不解码、不调用模型，输出同一采样时间轴上的空主体观察")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true")

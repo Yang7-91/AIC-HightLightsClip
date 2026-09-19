@@ -1,4 +1,4 @@
-"""Stage 3.5 主流水线：最终区间即时采样、Qwen 逐帧定位与原子持久化。
+"""Stage 3.5 主流水线：最终区间即时采样、Qwen 多主体观察与原子持久化。
 
 Stage 3 是时间边界的唯一来源；Stage 1 在这里仅提供源视频路径、FPS 和总帧数。
 本阶段明确不读取 Stage 1 的 ``coarse_frames`` 或 ``sample_map.jsonl``，因为
@@ -6,7 +6,7 @@ Stage 3 可能已把边界细化到任意原始帧，复用旧粗采样会造成
 
 ``predict`` 模式按默认 2 FPS 对每个最终高光区间重新解码，将该区间的全部
 采样 JPEG 作为一个有序多图请求发给 vLLM。``passthrough`` 模式只计算相同的
-采样帧计划，为每个计划帧写 ``subject_point=null``；它不会打开视频，也不会
+采样帧计划，为每个计划帧写空 ``targets``；它不会打开视频，也不会
 构建或调用模型客户端，因此可用于验证后续数据链路。
 """
 
@@ -27,13 +27,13 @@ from video_highlight.contracts.schema_versions import STAGE3_5_SCHEMA_VERSION
 
 from .frame_sampler import SampledFrame, plan_sample_frames, sample_interval
 from .prompt_builder import DEFAULT_SYSTEM_PROMPT, OUTPUT_SCHEMA_OPENAI, build_prompt, build_user_content
-from .qwen_adapter import SubjectPointBackend, build_backend
+from .qwen_adapter import SubjectObservationBackend, build_backend
 from .response_parser import parse_predictions
-from .validators import list_stage3_video_ids, load_video_inputs, validate_artifacts, validate_config, validate_points
+from .validators import list_stage3_video_ids, load_video_inputs, validate_artifacts, validate_config, validate_observations
 
 
-def _point_row(video_id: str, interval: dict[str, Any], sample_index: int, frame: int, fps: float, prediction: dict[str, Any], mode: str) -> dict[str, Any]:
-    """把模型局部 sample_index 和上游时间轴合成稳定的逐帧输出记录。"""
+def _observation_row(video_id: str, interval: dict[str, Any], sample_index: int, frame: int, fps: float, prediction: dict[str, Any], mode: str) -> dict[str, Any]:
+    """把模型局部 sample_index 和上游时间轴合成稳定的多主体观察记录。"""
 
     return {
         "schema_version": STAGE3_5_SCHEMA_VERSION,
@@ -43,31 +43,33 @@ def _point_row(video_id: str, interval: dict[str, Any], sample_index: int, frame
         "frame": frame,
         "timestamp_sec": frame / fps,
         "subject": interval.get("subject"),
-        "subject_point": prediction.get("subject_point"),
+        "group_mode": prediction.get("group_mode", "multiple"),
+        "grounding_phrases": list(prediction.get("grounding_phrases", [])),
+        "targets": list(prediction.get("targets", [])),
         "coordinate_space": "normalized_xy",
-        "confidence": float(prediction.get("confidence", 0.0)),
-        "visibility": str(prediction.get("visibility", "not_found")),
         "status": "skipped" if mode == "passthrough" else "predicted",
         "reason": str(prediction.get("reason", "")),
     }
 
 
-def _enriched_interval(interval: dict[str, Any], sample_count: int, visible_count: int, sample_fps: float, mode: str) -> dict[str, Any]:
-    """复制 Stage 3 区间并只追加 Stage 3.5 索引信息，不把点数组嵌进区间。"""
+def _enriched_interval(interval: dict[str, Any], sample_count: int, visible_observation_count: int,
+                       visible_target_count: int, sample_fps: float, mode: str) -> dict[str, Any]:
+    """复制 Stage 3 区间并追加 v2 多主体观察索引，不把观察数组嵌进区间。"""
 
     row = {key: value for key, value in interval.items() if key != "subject_point"}
     row["source_schema_version"] = row.get("schema_version")
     row["schema_version"] = STAGE3_5_SCHEMA_VERSION
-    row["subject_point_file"] = "subject_points.jsonl"
-    row["subject_point_sample_fps"] = sample_fps
-    row["subject_point_sample_count"] = sample_count
-    row["visible_subject_point_count"] = visible_count
-    row["subject_point_status"] = "skipped" if mode == "passthrough" else "predicted"
+    row["subject_observation_file"] = "subject_observations.jsonl"
+    row["subject_observation_sample_fps"] = sample_fps
+    row["subject_observation_sample_count"] = sample_count
+    row["visible_subject_observation_count"] = visible_observation_count
+    row["visible_subject_target_count"] = visible_target_count
+    row["subject_observation_status"] = "skipped" if mode == "passthrough" else "predicted"
     return row
 
 
 def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[str, Any],
-                      frames: list[SampledFrame], backend: SubjectPointBackend,
+                      frames: list[SampledFrame], backend: SubjectObservationBackend,
                       config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any],
                       list[dict[str, Any]], list[int],list[dict]]:
     """构造一次多图请求并解析；解析失败可按配置重试整个区间请求。config配置use_batch为false时1，降级为单帧请求"""
@@ -112,7 +114,7 @@ def _predict_interval(video_id: str, interval: dict[str, Any], metadata: dict[st
     raise last_error
 
 
-def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_output_dir: Path, backend: SubjectPointBackend | None, config: dict[str, Any], project_paths_config:dict[str, Any],resume: bool, overwrite: bool) -> dict[str, Any]:
+def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_output_dir: Path, backend: SubjectObservationBackend | None, config: dict[str, Any], project_paths_config:dict[str, Any],resume: bool, overwrite: bool) -> dict[str, Any]:
     """处理一个视频，并以目录重命名作为原子提交点。"""
 
     final_dir = videos_output_dir / video_id
@@ -131,7 +133,7 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
     mode = str(config["runtime"].get("mode", "predict"))
     fps = float(metadata["fps"])
     sample_fps = float(config["sampling"].get("fps", 2.0))
-    point_rows: list[dict[str, Any]] = []
+    observation_rows: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
     requests: list[dict[str, Any]] = []
     raw_responses: list[dict[str, Any]] = []
@@ -141,12 +143,18 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
             start, end = int(interval["start_frame"]), int(interval["end_frame"])
             planned_frames = plan_sample_frames(start, end, fps, sample_fps)
             missing_predictions: list[int] = []
+            error_predictions: list[dict[str, Any]] = []
             if mode == "passthrough":
                 # 跳过模式不能调用 sample_interval：即使 source_path 不存在也应能产出契约。
-                predictions = [{"subject_point": None, "confidence": 0.0, "visibility": "not_found", "reason": "stage3_5_processing_skipped"} for _ in planned_frames]
+                predictions = [{
+                    "group_mode": "multiple",
+                    "grounding_phrases": [],
+                    "targets": [],
+                    "reason": "stage3_5_processing_skipped",
+                } for _ in planned_frames]
             else:
                 if backend is None:
-                    raise RuntimeError("predict 模式缺少主体点模型 backend")
+                    raise RuntimeError("predict 模式缺少多主体观察模型 backend")
                 # 每个最终区间独立打开源视频并即时取帧；JPEG 只存在于当前内存对象。
                 # TODO 后续可以所有区间一次性读完，对于短视频多区间可以加快速度
                 frames = sample_interval(
@@ -162,7 +170,6 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 chunks_frames = [frames[i:i + step] for i in range(0, len(frames), step)] # 注：Python的切片操作在结束索引超过列表长度时，会自动截断到列表末尾，不会抛出 IndexError
                 predictions: list[dict[str, Any]] = []
                 missing_predictions: list[int] = []
-                error_predictions: list[dict] = []
                 for frames_in_chunk in chunks_frames:
                     predictions_chunk, request_chunk, raw_response_chunk, missing_predictions_chunk,error_predictions_chunk = \
                         _predict_interval(video_id, interval, metadata, frames_in_chunk, backend, config)
@@ -175,13 +182,24 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                         error_predictions.append(error_prediction)
                     requests.append(request_chunk)
                     raw_responses.extend(raw_response_chunk)
-            interval_points = [
-                _point_row(video_id, interval, index, frame, fps, predictions[index], mode)
+            interval_observations = [
+                _observation_row(video_id, interval, index, frame, fps, predictions[index], mode)
                 for index, frame in enumerate(planned_frames)
             ]
-            point_rows.extend(interval_points)
-            visible_count = sum(row["subject_point"] is not None for row in interval_points)
-            enriched.append(_enriched_interval(interval, len(planned_frames), visible_count, sample_fps, mode))
+            observation_rows.extend(interval_observations)
+            visible_observation_count = sum(
+                any(target.get("subject_point") is not None for target in row["targets"])
+                for row in interval_observations
+            )
+            visible_target_count = sum(
+                target.get("subject_point") is not None
+                for row in interval_observations
+                for target in row["targets"]
+            )
+            enriched.append(_enriched_interval(
+                interval, len(planned_frames), visible_observation_count,
+                visible_target_count, sample_fps, mode
+            ))
             diagnostics.append({
                 "schema_version": STAGE3_5_SCHEMA_VERSION,
                 "video_id": video_id,
@@ -189,7 +207,8 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 "mode": mode,
                 "status": "skipped_all_stage3_5_processing" if mode == "passthrough" else "completed",
                 "planned_sample_count": len(planned_frames),
-                "visible_point_count": visible_count,
+                "visible_observation_count": visible_observation_count,
+                "visible_target_count": visible_target_count,
                 "model_omitted_sample_indices": missing_predictions,
                 "error_predictions": error_predictions,
                 "sample_decoder": "skipped" if mode == "passthrough" else (
@@ -197,24 +216,32 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
                 ),
             })
             # 区间完成即刷新临时目录；若批处理中断，现有内容仍不会被下游当成成功产物。
-            write_jsonl(work_dir / "subject_points.jsonl", point_rows)
+            write_jsonl(work_dir / "subject_observations.jsonl", observation_rows)
             write_jsonl(work_dir / "enriched_intervals.jsonl", enriched)
             write_jsonl(work_dir / "requests.jsonl", requests)
             write_jsonl(work_dir / "raw_responses.jsonl", raw_responses)
             write_jsonl(work_dir / "diagnostics.jsonl", diagnostics)
         # 空高光视频也必须产生五个空 JSONL，保证下游无需特殊判断文件是否存在。
         if not intervals:
-            for name in ("subject_points.jsonl", "enriched_intervals.jsonl", "requests.jsonl", "raw_responses.jsonl", "diagnostics.jsonl"):
+            for name in ("subject_observations.jsonl", "enriched_intervals.jsonl", "requests.jsonl", "raw_responses.jsonl", "diagnostics.jsonl"):
                 write_jsonl(work_dir / name, [])
-        validate_points(point_rows, intervals, metadata, sample_fps)
+        validate_observations(observation_rows, intervals, metadata, sample_fps)
         validation = validate_artifacts(work_dir)
     success = success_record(
         video_id,
         elapsed_sec=timer.elapsed_sec,
         mode=mode,
         input_interval_count=len(intervals),
-        output_sample_count=len(point_rows),
-        located_point_count=sum(row["subject_point"] is not None for row in point_rows),
+        output_sample_count=len(observation_rows),
+        located_observation_count=sum(
+            any(target.get("subject_point") is not None for target in row["targets"])
+            for row in observation_rows
+        ),
+        located_target_count=sum(
+            target.get("subject_point") is not None
+            for row in observation_rows
+            for target in row["targets"]
+        ),
         sample_fps=sample_fps,
         validation=validation,
     )
@@ -223,12 +250,13 @@ def process_video(stage1_dir: Path, stage3_dir: Path, video_id: str, videos_outp
     return success
 
 
-def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str | Path, config: dict[str, Any], project_paths_config:dict[str, Any],
+def run_stage3_5(stage1_dir: str | Path, stage3_dir: str | Path, output_dir: str | Path, config: dict[str, Any], project_paths_config:dict[str, Any] | None = None,
                  video_ids: set[str] | None = None, limit: int | None = None, resume: bool = False,
                  overwrite: bool = False, strict: bool = False, logger: Any = None) -> dict[str, Any]:
     """批量入口；模型客户端只构建一次，并在所有视频之间复用连接。"""
 
     validate_config(config)
+    project_paths_config = project_paths_config or {}
     stage1_root, stage3_root, output_root = Path(stage1_dir).resolve(), Path(stage3_dir).resolve(), Path(output_dir).resolve()
     videos_output = output_root / "videos"
     videos_output.mkdir(parents=True, exist_ok=True)

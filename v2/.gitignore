@@ -16,6 +16,8 @@ model_store/qwen3.5-4b/*
 !model_store/qwen3.5-4b/.gitkeep
 model_store/sam2/*
 !model_store/sam2/.gitkeep
+model_store/grounding-dino-tiny/*
+!model_store/grounding-dino-tiny/.gitkeep
 model_store/temporal/*
 !model_store/temporal/.gitkeep
 data/input/videos/*

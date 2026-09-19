@@ -15,8 +15,8 @@ visualization:
   write_video: false
 
 tracking:
-  # 默认 OpenCV 后端无需新模型。可通过 CLI 切换 center 或 sam2。
-  backend: opencv
+  # 正式方案：Grounding DINO 多目标语义锚定 + SAM2 逐对象传播。
+  backend: sam2
   initial_width_ratio: 0.28
   initial_height_ratio: 0.38
   saliency_max_side: 320
@@ -35,9 +35,32 @@ tracking:
   # 锚点 Mask 若离 Qwen 点过远，会追加正点提示纠偏；仍无效则仅回退该锚点窗口。
   anchor_max_center_distance_ratio: 0.20
   correction_with_point_prompt: true
+  anchor_min_point_coverage: 0.5
+  grounding_min_coverage: 0.10
   offload_video_to_cpu: true
   offload_state_to_cpu: false
   async_loading_frames: false
+
+  grounding:
+    enabled: true
+    backend: huggingface
+    # 将 Hugging Face 模型完整下载到此目录；默认禁止运行期联网下载。
+    model: model_store/grounding-dino-tiny
+    local_files_only: true
+    device: cuda
+    box_threshold: 0.25
+    text_threshold: 0.25
+    selection_threshold: 0.45
+    max_objects: 8
+    nms_iou: 0.85
+    detection_weight: 0.40
+    point_weight: 0.35
+    temporal_weight: 0.25
+    claim_min_point_score: 0.20
+    multiple_min_point_score: 0.35
+    association_threshold: 0.30
+    # qwen: Grounding 推理失败时仍使用多 Qwen 点框启动 SAM2；error: 令区间失败。
+    error_policy: qwen
 
 crop_candidates:
   # 固定为目标比例下的最大合法框，只比较主体中心轨迹，避免动态尺度干扰实验。

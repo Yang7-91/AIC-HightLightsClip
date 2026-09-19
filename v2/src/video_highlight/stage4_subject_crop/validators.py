@@ -32,7 +32,8 @@ def load_video_inputs(
     stage1_dir: str | Path, stage3_5_dir: str | Path, video_id: str,project_paths_config:dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """
-    加载stage4的输入数据，同时进行数据校验。数据校验时，以enriched_intervals.jsonl为准，逐项核对subject_points.jsonl数据合法性
+    加载 Stage 4 输入并校验。优先读取 v2 ``subject_observations.jsonl``，同时兼容
+    v1 ``subject_points.jsonl``。
 
     Returns:
         metadata: stage1获取的视频的元信息
@@ -51,16 +52,49 @@ def load_video_inputs(
         metadata["source_path"] = str(Path(project_paths_config["video_root"]) / (video_id + ".mp4"))
     scenes = read_jsonl(stage1_video / "scenes.jsonl")
     intervals = read_jsonl(stage3_5_video / "enriched_intervals.jsonl")
-    point_rows = read_jsonl(stage3_5_video / "subject_points.jsonl")
-    points_by_interval: dict[str, list[dict[str, Any]]] = {}
-    for point in point_rows:
-        interval_id = str(point.get("interval_id", ""))
-        if str(point.get("video_id")) != video_id:
-            raise ArtifactValidationError(f"Stage 3.5 主体点 video_id 不一致: {interval_id}")
-        value = point.get("subject_point")
-        if value is not None and (not isinstance(value, list) or len(value) != 2 or not all(0.0 <= float(axis) <= 1.0 for axis in value)):
-            raise ArtifactValidationError(f"Stage 3.5 主体点非法: {interval_id}/{point.get('frame')}")
-        points_by_interval.setdefault(interval_id, []).append(point)
+    observation_path = stage3_5_video / "subject_observations.jsonl"
+    legacy_path = stage3_5_video / "subject_points.jsonl"
+    if observation_path.is_file():
+        observation_rows = read_jsonl(observation_path)
+        legacy = False
+    elif legacy_path.is_file():
+        observation_rows = read_jsonl(legacy_path)
+        legacy = True
+    else:
+        raise ArtifactValidationError(f"Stage 3.5 缺少主体观察文件: {observation_path}")
+    observations_by_interval: dict[str, list[dict[str, Any]]] = {}
+    for observation in observation_rows:
+        interval_id = str(observation.get("interval_id", ""))
+        if str(observation.get("video_id")) != video_id:
+            raise ArtifactValidationError(f"Stage 3.5 主体观察 video_id 不一致: {interval_id}")
+        if legacy:
+            value = observation.get("subject_point")
+            if value is not None and (
+                not isinstance(value, list) or len(value) != 2
+                or not all(0.0 <= float(axis) <= 1.0 for axis in value)
+            ):
+                raise ArtifactValidationError(f"Stage 3.5 主体点非法: {interval_id}/{observation.get('frame')}")
+        else:
+            if observation.get("group_mode") not in {"single", "multiple"}:
+                raise ArtifactValidationError(f"Stage 3.5 group_mode 非法: {interval_id}/{observation.get('frame')}")
+            targets = observation.get("targets")
+            if not isinstance(targets, list):
+                raise ArtifactValidationError(f"Stage 3.5 targets 非数组: {interval_id}/{observation.get('frame')}")
+            seen_target_ids: set[str] = set()
+            for target in targets:
+                if not isinstance(target, dict):
+                    raise ArtifactValidationError(f"Stage 3.5 target 非对象: {interval_id}")
+                target_id = str(target.get("target_id", ""))
+                if not target_id or target_id in seen_target_ids:
+                    raise ArtifactValidationError(f"Stage 3.5 target_id 为空或重复: {interval_id}/{target_id}")
+                seen_target_ids.add(target_id)
+                value = target.get("subject_point")
+                if value is not None and (
+                    not isinstance(value, list) or len(value) != 2
+                    or not all(0.0 <= float(axis) <= 1.0 for axis in value)
+                ):
+                    raise ArtifactValidationError(f"Stage 3.5 target 点非法: {interval_id}/{target_id}")
+        observations_by_interval.setdefault(interval_id, []).append(observation)
     frame_count = int(metadata["frame_count"])
     previous_end = -1
     for interval in intervals:
@@ -71,18 +105,23 @@ def load_video_inputs(
             raise ArtifactValidationError("Stage 3.5 区间重叠或未排序")
         previous_end = end
         interval_id = str(interval["interval_id"])
-        interval["subject_points"] = sorted(points_by_interval.pop(interval_id, []), key=lambda row: int(row["frame"]))
-        expected_count = int(interval.get("subject_point_sample_count", len(interval["subject_points"])))
-        if len(interval["subject_points"]) != expected_count:
-            raise ArtifactValidationError(f"Stage 3.5 主体点数量与区间摘要不一致: {interval_id}")
-        sample_indices = [int(point["sample_index"]) for point in interval["subject_points"]]
+        rows = sorted(observations_by_interval.pop(interval_id, []), key=lambda row: int(row["frame"]))
+        if legacy:
+            interval["subject_points"] = rows
+            expected_count = int(interval.get("subject_point_sample_count", len(rows)))
+        else:
+            interval["subject_observations"] = rows
+            expected_count = int(interval.get("subject_observation_sample_count", len(rows)))
+        if len(rows) != expected_count:
+            raise ArtifactValidationError(f"Stage 3.5 主体观察数量与区间摘要不一致: {interval_id}")
+        sample_indices = [int(row["sample_index"]) for row in rows]
         if sample_indices != list(range(len(sample_indices))):
             raise ArtifactValidationError(f"Stage 3.5 sample_index 不连续或顺序异常: {interval_id}")
-        for point in interval["subject_points"]:
-            if not start <= int(point["frame"]) < end:
-                raise ArtifactValidationError(f"Stage 3.5 主体点不属于区间: {interval_id}/{point['frame']}")
-    if points_by_interval:
-        raise ArtifactValidationError(f"Stage 3.5 主体点引用未知区间: {sorted(points_by_interval)}")
+        for observation in rows:
+            if not start <= int(observation["frame"]) < end:
+                raise ArtifactValidationError(f"Stage 3.5 主体观察不属于区间: {interval_id}/{observation['frame']}")
+    if observations_by_interval:
+        raise ArtifactValidationError(f"Stage 3.5 主体观察引用未知区间: {sorted(observations_by_interval)}")
     return metadata, scenes, intervals
 
 
@@ -101,6 +140,20 @@ def validate_config(config: dict[str, Any]) -> None:
     distance = float(config["tracking"].get("anchor_max_center_distance_ratio", 0.20))
     if not 0.0 <= distance <= 1.0:
         raise ArtifactValidationError("tracking.anchor_max_center_distance_ratio 必须在 [0,1] 内")
+    grounding = config["tracking"].get("grounding", {})
+    if not isinstance(grounding, dict):
+        raise ArtifactValidationError("tracking.grounding 必须是对象")
+    if bool(grounding.get("enabled", False)):
+        if not str(grounding.get("model", "")).strip():
+            raise ArtifactValidationError("启用 Grounding DINO 时 tracking.grounding.model 不能为空")
+        for key in ("box_threshold", "text_threshold", "selection_threshold", "nms_iou", "association_threshold"):
+            value = float(grounding.get(key, 0.0))
+            if not 0.0 <= value <= 1.0:
+                raise ArtifactValidationError(f"tracking.grounding.{key} 必须在 [0,1] 内")
+        if int(grounding.get("max_objects", 8)) <= 0:
+            raise ArtifactValidationError("tracking.grounding.max_objects 必须大于 0")
+        if str(grounding.get("error_policy", "qwen")) not in {"qwen", "error"}:
+            raise ArtifactValidationError("tracking.grounding.error_policy 只能是 qwen 或 error")
     visualization = config.get("visualization", {})
     if not isinstance(visualization, dict):
         raise ArtifactValidationError("visualization 必须是对象")
@@ -144,7 +197,7 @@ def validate_crops(rows: list[dict[str, Any]], metadata: dict[str, Any]) -> None
 
 def validate_stage4_artifacts(video_dir: str | Path) -> dict[str, int]:
     root = Path(video_dir)
-    required = ("crops.jsonl", "tracks.jsonl", "diagnostics.jsonl")
+    required = ("crops.jsonl", "tracks.jsonl", "diagnostics.jsonl", "grounding_anchors.jsonl")
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         raise ArtifactValidationError(f"Stage 4 缺少产物: {', '.join(missing)}")

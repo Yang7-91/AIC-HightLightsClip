@@ -3,8 +3,8 @@
 本模块负责把前序阶段的“高光时间区间”转换成比赛所需的逐帧构图框。数据依赖被
 刻意限制为以下两类，Stage 4 不读取 Stage 2：
 
-1. Stage 3.5 ``enriched_intervals.jsonl`` 和 ``subject_points.jsonl``：高光的
-   左闭右开帧区间、主体描述，以及默认 2 FPS 的逐采样帧归一化主体中心；
+1. Stage 3.5 ``enriched_intervals.jsonl`` 和 ``subject_observations.jsonl``：高光的
+   左闭右开帧区间、主体描述、Grounding 短语和默认 2 FPS 的多目标归一化中心；
 2. Stage 1 ``metadata.json`` 和 ``scenes.jsonl``：只有源视频路径、画面尺寸、
    ``targetRatioWH``、总帧数和镜头边界等空间处理不可替代的信息。
 
@@ -167,6 +167,7 @@ def _plan_single_scene_span(
             "bboxes": finalize_bbox(crop, frame_size, target_ratio),
             "track_confidence": point.confidence,
             "track_source": point.source,
+            "track_object_count": point.object_count,
         })
         # 同步保存原始主体 xyxy，而不是只保留最终构图框。若最终构图不理想，便可
         # 区分是“跟错主体”还是“主体正确但构图策略不合适”。
@@ -178,6 +179,8 @@ def _plan_single_scene_span(
             "subject_box_xyxy": [float(value) for value in point.subject_box],
             "confidence": point.confidence,
             "source": point.source,
+            "object_count": point.object_count,
+            "object_ids": list(point.object_ids),
         })
     return crops, tracks
 
@@ -194,7 +197,7 @@ def _planning_spans(interval: dict[str, Any], scenes: list[dict[str, Any]]) -> l
 
 
 def _plan_across_scenes_and_merge_to_interval(
-    interval_with_subject_points: dict[str, Any],
+    interval_with_observations: dict[str, Any],
     points: list[TrackPoint],
     scenes: list[dict[str, Any]],
     frame_size: tuple[int, int],
@@ -211,15 +214,15 @@ def _plan_across_scenes_and_merge_to_interval(
     内部镜头边界处断开优化。
     """
 
-    interval_start = int(interval_with_subject_points["start_frame"])
+    interval_start = int(interval_with_observations["start_frame"])
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
-    spans = _planning_spans(interval_with_subject_points, scenes)
+    spans = _planning_spans(interval_with_observations, scenes)
     for span_start, span_end in spans:
         # 绝对帧号转换为 points 列表里的相对索引。end 保持左闭右开约定。
         local_start = span_start - interval_start
         local_end = span_end - interval_start
-        span_interval = {**interval_with_subject_points, "start_frame": span_start, "end_frame": span_end}
+        span_interval = {**interval_with_observations, "start_frame": span_start, "end_frame": span_end}
         span_crops, span_tracks = _plan_single_scene_span(
             span_interval,
             points[local_start:local_end],
@@ -287,9 +290,9 @@ def process_video(
 
     # load_video_inputs 是 Stage 4 唯一的上游读取入口：
     # - Stage 1：metadata.json、scenes.jsonl；
-    # - Stage 3.5：enriched_intervals.jsonl、subject_points.jsonl。
+    # - Stage 3.5：enriched_intervals.jsonl、subject_observations.jsonl（兼容旧 subject_points.jsonl）。
     # Stage 4 不接收 Stage 3 路径；时间、语义和空间提示均以 Stage 3.5 为唯一契约。
-    metadata, scenes, intervals_with_subject_points = load_video_inputs(stage1_dir, stage3_5_dir, video_id,project_paths_config)
+    metadata, scenes, intervals_with_observations = load_video_inputs(stage1_dir, stage3_5_dir, video_id,project_paths_config)
     frame_size = _frame_size(metadata)
     target_ratio = _target_ratio(metadata)
     # 源视频不复制到项目中，直接使用 Stage 1 已持久化的绝对 source_path。
@@ -299,24 +302,26 @@ def process_video(
     crops: list[dict[str, Any]] = []
     tracks: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
+    grounding_anchors: list[dict[str, Any]] = []
     fallback_count = 0
     error_policy = str(config["runtime"].get("interval_error_policy", "center"))
 
     # Timer 覆盖实际区间处理和产物校验，不包含最终目录重命名后的批处理汇总。
     with Timer() as timer:
-        for interval_with_subject_points in intervals_with_subject_points:
+        for interval_with_observations in intervals_with_observations:
             try:
                 # 正常路径：指定后端（OpenCV/SAM2/center）先产生逐帧主体框，
                 # 再按Stage 1 镜头边界独立完成构图优化，禁止跨硬切镜头平滑。
                 points = tracker.track(
                     video_path,
-                    interval_with_subject_points,
+                    interval_with_observations,
                     frame_size,
                     scenes,
                     work_dir / "visualizations",
                 )
+                grounding_anchors.extend(getattr(tracker, "last_grounding_records", []))
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
-                    interval_with_subject_points, points, scenes, frame_size, target_ratio, config
+                    interval_with_observations, points, scenes, frame_size, target_ratio, config
                 )
                 status = "tracked"
             except Exception as error:
@@ -327,13 +332,13 @@ def process_video(
                 fallback_count += 1
                 # 降级仍然经过同一套候选、DP、平滑、限界和校验流程，从而保证输出契约
                 # 与正常跟踪路径完全一致。
-                points = _center_points(interval_with_subject_points, frame_size, config.get("tracking", {}), scenes)
+                points = _center_points(interval_with_observations, frame_size, config.get("tracking", {}), scenes)
                 interval_crops, interval_tracks, planning_span_count = _plan_across_scenes_and_merge_to_interval(
-                    interval_with_subject_points, points, scenes, frame_size, target_ratio, config
+                    interval_with_observations, points, scenes, frame_size, target_ratio, config
                 )
                 status = "center_fallback"
                 # 保存异常类型和消息但不中断本视频，方便后续统计哪些区间曾经降级。
-                diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval_with_subject_points["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
+                diagnostics.append({"schema_version": STAGE4_SCHEMA_VERSION, "video_id": video_id, "interval_id": interval_with_observations["interval_id"], "status": status, "planning_span_count": planning_span_count, "error_type": type(error).__name__, "message": str(error)})
 
             # 每个 Stage 3.5 区间不会与其他区间重叠；先累积，循环结束后统一排序校验。
             crops.extend(interval_crops)
@@ -347,7 +352,7 @@ def process_video(
                 diagnostics.append({
                     "schema_version": STAGE4_SCHEMA_VERSION,
                     "video_id": video_id,
-                    "interval_id": interval_with_subject_points["interval_id"],
+                    "interval_id": interval_with_observations["interval_id"],
                     "status": status,
                     "frame_count": len(interval_crops),
                     "planning_span_count": planning_span_count,
@@ -369,11 +374,12 @@ def process_video(
         write_jsonl(work_dir / "crops.jsonl", crops)
         write_jsonl(work_dir / "tracks.jsonl", tracks)
         write_jsonl(work_dir / "diagnostics.jsonl", diagnostics)
+        write_jsonl(work_dir / "grounding_anchors.jsonl", grounding_anchors)
         # 文件级校验确认三个必需产物都真实存在。
         validation = validate_stage4_artifacts(work_dir)
 
     # _SUCCESS.json 必须最后写入。它既是下游可消费标记，也是 --resume 的判定依据。
-    success = success_record(video_id, elapsed_sec=timer.elapsed_sec, backend=config["tracking"].get("backend", "opencv"), interval_count=len(intervals_with_subject_points), prediction_frame_count=len(crops), fallback_count=fallback_count, validation=validation)
+    success = success_record(video_id, elapsed_sec=timer.elapsed_sec, backend=config["tracking"].get("backend", "opencv"), interval_count=len(intervals_with_observations), prediction_frame_count=len(crops), fallback_count=fallback_count, validation=validation)
     write_json(work_dir / "_SUCCESS.json", success)
     # 同一文件系统内目录重命名把已验证的工作目录一次性提交为正式视频产物。
     work_dir.rename(final_dir)

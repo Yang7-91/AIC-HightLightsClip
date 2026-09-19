@@ -1,4 +1,4 @@
-"""解析模型逐帧主体点响应并补齐遗漏帧。"""
+"""解析 Qwen 的逐帧多主体观察并补齐遗漏采样帧。"""
 
 from __future__ import annotations
 
@@ -7,21 +7,145 @@ import math
 from typing import Any
 
 from video_highlight.common.exceptions import ArtifactValidationError
+
 from .frame_sampler import SampledFrame
 
 
-def  _join_error_prediction(error_predictions:list[dict],error_item:dict,error_reason:str):
-    error_prediction = {
-        "error_reason": error_reason,
-        **error_item
-    }
-    error_predictions.append(error_prediction)
+def _join_error_prediction(
+    errors: list[dict[str, Any]], item: dict[str, Any], reason: str
+) -> None:
+    errors.append({"error_reason": reason, **item})
 
-def parse_predictions(text: str, frames: list[SampledFrame], use_batch:bool=False) -> tuple[list[dict[str, Any]], list[int],list[dict]]:
-    sample_count = len(frames)
-    sample_start = min(frame.sample_index for frame in frames)
-    # 致命错误，无法修复，直接抛出异常。后续可能需要做降级处理修复，保证一定有后续步骤可用的输出
-    # 当前默认模型需要能够输出正确格式的结果，预测坐标可以缺失、错误，否则直接视为模型忽略该帧
+
+def _normalize_axis(value: float, size: int) -> float:
+    """兼容归一化、千分制和像素坐标，最终限制到 ``[0, 1]``。"""
+
+    if value <= 1.5:
+        normalized = value
+    elif value <= 1000.0:
+        normalized = value / 1000.0
+    elif size > 0:
+        normalized = value / float(size)
+    else:
+        normalized = value / 1000.0
+    return max(0.0, min(1.0, normalized))
+
+
+def _normalize_point(value: Any, frame: SampledFrame) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("subject_point 非 [x,y]")
+    point = [float(value[0]), float(value[1])]
+    if not all(math.isfinite(axis) and axis >= 0.0 for axis in point):
+        raise ValueError(f"subject_point 含非法坐标: {point}")
+    return [
+        _normalize_axis(point[0], frame.width),
+        _normalize_axis(point[1], frame.height),
+    ]
+
+
+def _phrases(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        phrase = str(raw).strip().lower().rstrip(". ")
+        if phrase and phrase not in seen:
+            output.append(phrase)
+            seen.add(phrase)
+    return output[:8]
+
+
+def _legacy_targets(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """把旧版单点响应适配为 v2 单目标结构，便于滚动升级模型端。"""
+
+    if "subject_point" not in item:
+        return []
+    return [
+        {
+            "target_id": "primary",
+            "description": "primary subject",
+            "grounding_phrase": "main subject",
+            "subject_point": item.get("subject_point"),
+            "confidence": item.get("confidence", 0.0),
+            "visibility": item.get("visibility", "not_found"),
+        }
+    ]
+
+
+def _parse_targets(
+    item: dict[str, Any], frame: SampledFrame, errors: list[dict[str, Any]], index: int
+) -> list[dict[str, Any]]:
+    raw_targets = item.get("targets")
+    if raw_targets is None:
+        raw_targets = _legacy_targets(item)
+    if not isinstance(raw_targets, list):
+        _join_error_prediction(errors, item, f"sample_index={index} 的 targets 非数组")
+        return []
+
+    targets: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for position, raw in enumerate(raw_targets[:12]):
+        if not isinstance(raw, dict):
+            _join_error_prediction(errors, item, f"sample_index={index} 的 target[{position}] 非对象")
+            continue
+        base_id = str(raw.get("target_id") or f"target_{position}").strip()[:40] or f"target_{position}"
+        target_id = base_id
+        suffix = 2
+        while target_id in used_ids:
+            target_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(target_id)
+        try:
+            point = _normalize_point(raw.get("subject_point"), frame)
+        except (TypeError, ValueError) as error:
+            _join_error_prediction(errors, raw, f"sample_index={index}/{target_id}: {error}")
+            point = None
+        try:
+            confidence = float(raw.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            confidence = 0.0
+        visibility = str(raw.get("visibility", "not_found"))
+        if visibility not in {"visible", "occluded", "not_found"}:
+            visibility = "not_found"
+        if visibility == "visible" and point is None:
+            visibility = "not_found"
+        phrase = str(raw.get("grounding_phrase", "")).strip().lower().rstrip(". ")
+        if not phrase:
+            phrase = "main subject"
+        targets.append(
+            {
+                "target_id": target_id,
+                "description": str(raw.get("description", "")).strip()[:80],
+                "grounding_phrase": phrase[:80],
+                "subject_point": point,
+                "confidence": confidence,
+                "visibility": visibility,
+            }
+        )
+    return targets
+
+
+def _empty_prediction(reason: str) -> dict[str, Any]:
+    return {
+        "group_mode": "multiple",
+        "grounding_phrases": [],
+        "targets": [],
+        "reason": reason,
+    }
+
+
+def parse_predictions(
+    text: str, frames: list[SampledFrame], use_batch: bool = False
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]]]:
+    """解析结构化响应；局部 target 错误只丢弃该 target，不丢弃整个区间。"""
+
+    if not frames:
+        return [], [], []
     try:
         root = json.loads(text)
     except json.JSONDecodeError as error:
@@ -30,68 +154,41 @@ def parse_predictions(text: str, frames: list[SampledFrame], use_batch:bool=Fals
     if not isinstance(predictions, list):
         raise ArtifactValidationError("Stage 3.5 响应缺少 predictions 数组")
 
-    error_predictions = []
+    by_sample = {frame.sample_index: frame for frame in frames}
+    ordered_indices = [frame.sample_index for frame in frames]
+    errors: list[dict[str, Any]] = []
     by_index: dict[int, dict[str, Any]] = {}
     for item in predictions:
         if not isinstance(item, dict):
             raise ArtifactValidationError("prediction 必须是对象")
         index = int(item.get("sample_index", -1))
-        if not sample_start <= index < sample_start+sample_count:
-            _join_error_prediction(error_predictions, item,error_reason=f"未知 sample_index: {index}")
+        if index not in by_sample:
+            _join_error_prediction(errors, item, f"未知 sample_index: {index}")
             continue
         if index in by_index:
-            _join_error_prediction(error_predictions, item, error_reason=f"重复 sample_index: {index}")
+            _join_error_prediction(errors, item, f"重复 sample_index: {index}")
             continue
-        point = item.get("subject_point")
-        if point is not None:
-            if not isinstance(point, list) or len(point) != 2:
-                _join_error_prediction(error_predictions, item, error_reason=f"sample_index={index} 的 subject_point 非 [x,y]")
-                continue
-            point = [float(point[0]), float(point[1])]
-            if not all(math.isfinite(value) and value>0 for value in point):
-                _join_error_prediction(error_predictions, item,error_reason=f"sample_index={index} 的坐标{point}非有效数")
-                continue
-            # 预先设定的归一化防御处理
-            def _norm(v, size):
-                if v <= 1.5:
-                    n = v
-                elif v <= 1000.0:
-                    n = v / 1000.0
-                elif size:
-                    n = v / float(size)
-                else:
-                    n = v / 1000.0
-                return max(0.0, min(1.0, n))
-            point[0] = _norm(point[0], frames[index-sample_start].width)
-            point[1] = _norm(point[1], frames[index-sample_start].height)
-        else:
-            _join_error_prediction(error_predictions, item, error_reason=f"sample_index={index} 的坐标{point}为空")
-            continue
-
-        confidence = float(item.get("confidence", 0.0))
-        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-            # raise ArtifactValidationError(f"sample_index={index} 的 confidence 非法") # 暂不处理
-            confidence = 0.5
-        visibility = str(item.get("visibility", "not_found"))
-        if visibility not in {"visible", "occluded", "not_found"}:
-            raise ArtifactValidationError(f"sample_index={index} 的 visibility 非法")
-        # if visibility == "visible" and point is None:
-        #     raise ArtifactValidationError(f"sample_index={index} 标记 visible 却没有坐标")
+        targets = _parse_targets(item, by_sample[index], errors, index)
+        phrases = _phrases(item.get("grounding_phrases"))
+        for target in targets:
+            phrase = target["grounding_phrase"]
+            if phrase not in phrases:
+                phrases.append(phrase)
+        group_mode = str(item.get("group_mode", "multiple" if len(targets) > 1 else "single"))
+        if group_mode not in {"single", "multiple"}:
+            group_mode = "multiple" if len(targets) > 1 else "single"
+        if group_mode == "single" and len(targets) > 1:
+            group_mode = "multiple"
         by_index[index] = {
-            "subject_point": point,
-            "confidence": confidence,
-            "visibility": visibility,
+            "group_mode": group_mode,
+            "grounding_phrases": phrases[:8],
+            "targets": targets,
             "reason": str(item.get("reason", "")),
         }
-        if not use_batch:  # 得到第一个值后直接赋值,并立马退出遍历
+        if not use_batch:
             break
-    missing = [index for index in range(sample_start,sample_start+sample_count) if index not in by_index]
-    # 不因少量漏答丢弃整段：缺失项显式降级为 not_found，并在 diagnostics 中记录。
+
+    missing = [index for index in ordered_indices if index not in by_index]
     for index in missing:
-        by_index[index] = {
-            "subject_point": None,
-            "confidence": 0.0,
-            "visibility": "not_found",
-            "reason": "model_omitted_sample",
-        }
-    return [by_index[index] for index in range(sample_start,sample_start+sample_count)], missing, error_predictions
+        by_index[index] = _empty_prediction("model_omitted_sample")
+    return [by_index[index] for index in ordered_indices], missing, errors

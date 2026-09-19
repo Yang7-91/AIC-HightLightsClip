@@ -18,10 +18,11 @@ if str(SRC_ROOT) not in sys.path:
 from video_highlight.common.atomic_io import write_json, write_jsonl
 from video_highlight.stage4_subject_crop.boundary_limiter import finalize_bbox, legal_crop_from_state, maximum_crop_width
 from video_highlight.stage4_subject_crop.crop_candidates import generate_crop_candidates
+from video_highlight.stage4_subject_crop.grounding_selector import GroundedDetection, associate_object_ids, select_detections
 from video_highlight.stage4_subject_crop.pipeline import run_stage4
 from video_highlight.stage4_subject_crop.pipeline import _planning_spans
 from video_highlight.stage4_subject_crop.propagation_visualizer import PropagationVisualizer
-from video_highlight.stage4_subject_crop.sam2_adapter import anchor_windows
+from video_highlight.stage4_subject_crop.sam2_adapter import SAM2SubjectTracker, anchor_windows
 from video_highlight.stage4_subject_crop.subject_tracker import CenterSubjectTracker
 from video_highlight.stage4_subject_crop.trajectory_smoother import smooth_trajectory
 
@@ -155,6 +156,97 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(windows[0].point, (0.2, 0.4))
         self.assertEqual(windows[2].point, (0.7, 0.4))
 
+    def test_center_backend_unions_multiple_subject_points(self) -> None:
+        tracker = CenterSubjectTracker({"initial_width_ratio": 0.1, "initial_height_ratio": 0.2})
+        interval = {
+            "start_frame": 0,
+            "end_frame": 2,
+            "subject_observations": [{
+                "frame": 0,
+                "group_mode": "multiple",
+                "grounding_phrases": ["person"],
+                "targets": [
+                    {"target_id": "left", "subject_point": [0.2, 0.5], "confidence": 0.9},
+                    {"target_id": "right", "subject_point": [0.8, 0.5], "confidence": 0.8},
+                ],
+            }],
+        }
+        rows = tracker.track(Path(), interval, (1000, 500), [{"start_frame": 0, "end_frame": 2}])
+        self.assertEqual(rows[0].object_count, 2)
+        self.assertLess(rows[0].subject_box[0], 200)
+        self.assertGreater(rows[0].subject_box[2], 800)
+
+
+class GroundingSelectionTests(unittest.TestCase):
+    def test_multiple_qwen_points_claim_distinct_detections(self) -> None:
+        detections = [
+            GroundedDetection((100, 100, 300, 500), 0.8, "person"),
+            GroundedDetection((700, 100, 900, 500), 0.8, "person"),
+            GroundedDetection((400, 100, 600, 500), 0.95, "person"),
+        ]
+        selected, scored = select_detections(
+            detections,
+            [(0.2, 0.5), (0.8, 0.5)],
+            {},
+            "multiple",
+            (1000, 600),
+            {"selection_threshold": 0.3, "multiple_min_point_score": 0.7, "max_objects": 4},
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({row.box_xyxy for row in selected}, {detections[0].box_xyxy, detections[1].box_xyxy})
+        self.assertEqual(len(scored), 3)
+
+    def test_object_ids_are_reused_by_spatial_association(self) -> None:
+        detections = [
+            GroundedDetection((105, 100, 305, 500), 0.8, "person"),
+            GroundedDetection((705, 100, 905, 500), 0.8, "person"),
+        ]
+        assigned, next_id = associate_object_ids(
+            detections,
+            {3: [100, 100, 300, 500], 7: [700, 100, 900, 500]},
+            8,
+            (1000, 600),
+            {"association_threshold": 0.3},
+        )
+        self.assertEqual([object_id for object_id, _ in assigned], [3, 7])
+        self.assertEqual(next_id, 8)
+
+    def test_sam2_unions_only_active_object_masks(self) -> None:
+        class FakeTensor:
+            def __init__(self, value: np.ndarray) -> None:
+                self.value = value
+
+            def detach(self):
+                return self
+
+            def float(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self.value
+
+        tracker = SAM2SubjectTracker.__new__(SAM2SubjectTracker)
+        first = np.full((1, 10, 20), -1.0, dtype=np.float32)
+        second = np.full((1, 10, 20), -1.0, dtype=np.float32)
+        stale = np.full((1, 10, 20), -1.0, dtype=np.float32)
+        first[:, 2:5, 1:4] = 1.0
+        second[:, 4:8, 12:18] = 1.0
+        stale[:, 0:2, 8:10] = 1.0
+        union, boxes = tracker._active_masks(
+            [1, 2, 99],
+            [FakeTensor(first), FakeTensor(second), FakeTensor(stale)],
+            {1, 2},
+            (20, 10),
+        )
+        point = tracker._track_point(5, union, "sam2_grounding_dino_propagated", (1, 2))
+        self.assertEqual(set(boxes), {1, 2})
+        self.assertEqual(point.subject_box, [1.0, 2.0, 18.0, 8.0])
+        self.assertEqual(point.object_count, 2)
+        self.assertEqual(int(union[0, 8]), 0)
+
 
 class CenterPipelineTests(unittest.TestCase):
     def test_stage4_consumes_stage1_and_stage3_5_without_stage3(self) -> None:
@@ -184,6 +276,37 @@ class CenterPipelineTests(unittest.TestCase):
             self.assertTrue(all(len(row["bboxes"]) == 3 for row in rows))
             self.assertFalse((root / "stage2").exists())
             self.assertFalse((root / "stage3").exists())
+
+    def test_stage4_consumes_v2_multi_target_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stage1_video = root / "stage1/videos/0"
+            stage3_5_video = root / "stage3_5/videos/0"
+            stage1_video.mkdir(parents=True)
+            stage3_5_video.mkdir(parents=True)
+            write_json(stage1_video / "metadata.json", {"video_id": "0", "source_path": "not-used.mp4", "width": 1000, "height": 500, "frame_count": 10, "fps": 10.0, "targetRatioWH": [16, 9]})
+            write_jsonl(stage1_video / "scenes.jsonl", [{"scene_id": 0, "start_frame": 0, "end_frame": 10}])
+            write_json(stage1_video / "_SUCCESS.json", {"status": "success"})
+            write_jsonl(stage3_5_video / "enriched_intervals.jsonl", [{
+                "schema_version": "stage3.5.v2", "video_id": "0", "interval_id": "0_interval_0000",
+                "start_frame": 2, "end_frame": 5, "subject": "two people",
+                "subject_observation_sample_count": 1,
+            }])
+            write_jsonl(stage3_5_video / "subject_observations.jsonl", [{
+                "schema_version": "stage3.5.v2", "video_id": "0", "interval_id": "0_interval_0000",
+                "sample_index": 0, "frame": 2, "group_mode": "multiple",
+                "grounding_phrases": ["person"],
+                "targets": [
+                    {"target_id": "left", "description": "left", "grounding_phrase": "person", "subject_point": [0.2, 0.5], "confidence": 0.9, "visibility": "visible"},
+                    {"target_id": "right", "description": "right", "grounding_phrase": "person", "subject_point": [0.8, 0.5], "confidence": 0.8, "visibility": "visible"},
+                ],
+            }])
+            write_json(stage3_5_video / "_SUCCESS.json", {"status": "success"})
+            summary = run_stage4(root / "stage1", root / "stage3_5", root / "stage4", center_config(), {"video_root": str(root)}, strict=True)
+            tracks = [json.loads(line) for line in (root / "stage4/videos/0/tracks.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(summary["success_count"], 1)
+            self.assertTrue(all(row["object_count"] == 2 for row in tracks))
+            self.assertTrue((root / "stage4/videos/0/grounding_anchors.jsonl").is_file())
 
 
 if __name__ == "__main__":

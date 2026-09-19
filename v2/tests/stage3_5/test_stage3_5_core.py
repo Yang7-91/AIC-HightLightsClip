@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from video_highlight.common.atomic_io import write_json, write_jsonl
-from video_highlight.stage3_5_subject_point.frame_sampler import _split_mjpeg_stream, plan_sample_frames
+from video_highlight.stage3_5_subject_point.frame_sampler import SampledFrame, _split_mjpeg_stream, plan_sample_frames
 from video_highlight.stage3_5_subject_point.pipeline import run_stage3_5
 from video_highlight.stage3_5_subject_point.response_parser import parse_predictions
 
@@ -44,11 +44,40 @@ class SamplingTests(unittest.TestCase):
 
 class ParserTests(unittest.TestCase):
     def test_missing_sample_is_explicitly_filled(self) -> None:
-        text = json.dumps({"predictions": [{"sample_index": 0, "subject_point": [0.25, 0.75], "confidence": 0.9, "visibility": "visible", "reason": "ok"}]})
-        rows, missing,_errors = parse_predictions(text, 2) # 源码已修改，测试代码还未修改
+        frames = [
+            SampledFrame(index, index * 5, index * 0.5, b"jpeg", 640, 360)
+            for index in range(2)
+        ]
+        text = json.dumps({"predictions": [{
+            "sample_index": 0,
+            "group_mode": "multiple",
+            "grounding_phrases": ["dog", "person"],
+            "targets": [
+                {"target_id": "dog", "description": "dog", "grounding_phrase": "dog", "subject_point": [0.25, 0.75], "confidence": 0.9, "visibility": "visible"},
+                {"target_id": "owner", "description": "owner", "grounding_phrase": "person", "subject_point": [0.75, 0.70], "confidence": 0.8, "visibility": "visible"},
+            ],
+            "reason": "ok",
+        }]})
+        rows, missing, errors = parse_predictions(text, frames)
         self.assertEqual(missing, [1])
-        self.assertEqual(rows[0]["subject_point"], [0.25, 0.75])
-        self.assertIsNone(rows[1]["subject_point"])
+        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.25, 0.75])
+        self.assertEqual(len(rows[0]["targets"]), 2)
+        self.assertEqual(rows[0]["grounding_phrases"], ["dog", "person"])
+        self.assertEqual(rows[1]["targets"], [])
+        self.assertEqual(errors, [])
+
+    def test_legacy_single_point_response_is_adapted(self) -> None:
+        frame = SampledFrame(4, 20, 2.0, b"jpeg", 100, 100)
+        text = json.dumps({"predictions": [{
+            "sample_index": 4,
+            "subject_point": [0.0, 1.0],
+            "confidence": 0.7,
+            "visibility": "visible",
+            "reason": "legacy",
+        }]})
+        rows, missing, _ = parse_predictions(text, [frame])
+        self.assertEqual(missing, [])
+        self.assertEqual(rows[0]["targets"][0]["subject_point"], [0.0, 1.0])
 
 
 class PassthroughPipelineTests(unittest.TestCase):
@@ -65,10 +94,10 @@ class PassthroughPipelineTests(unittest.TestCase):
             write_jsonl(stage3_video / "refined_intervals.jsonl", [{"schema_version": "stage3.v2", "video_id": "0", "interval_id": "0_interval_0000", "start_frame": 3, "end_frame": 15, "subject": "dog"}])
             write_json(stage3_video / "_SUCCESS.json", {"status": "success"})
             summary = run_stage3_5(root / "stage1", root / "stage3", root / "stage3_5", passthrough_config(), strict=True)
-            rows = [json.loads(line) for line in (root / "stage3_5/videos/0/subject_points.jsonl").read_text(encoding="utf-8").splitlines()]
+            rows = [json.loads(line) for line in (root / "stage3_5/videos/0/subject_observations.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(summary["success_count"], 1)
             self.assertEqual([row["frame"] for row in rows], [3, 8, 13])
-            self.assertTrue(all(row["subject_point"] is None and row["status"] == "skipped" for row in rows))
+            self.assertTrue(all(row["targets"] == [] and row["status"] == "skipped" for row in rows))
 
 
 if __name__ == "__main__":

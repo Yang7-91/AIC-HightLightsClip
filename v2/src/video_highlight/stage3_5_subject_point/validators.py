@@ -38,7 +38,7 @@ def load_video_inputs(stage1_dir: str | Path, stage3_dir: str | Path, video_id: 
         raise ArtifactValidationError(f"Stage 3 视频没有成功标记: {stage3_video}")
     metadata = _read_object(stage1_video / "metadata.json")
     # 当切换环境后，视频路径发生改变，此时默认使用配置文件路径，默认mp4
-    if not Path(metadata["source_path"]).is_file():
+    if not Path(metadata["source_path"]).is_file() and project_paths_config.get("video_root"):
         metadata["source_path"] = str(Path(project_paths_config["video_root"]) / (video_id+".mp4"))
     intervals = read_jsonl(stage3_video / "refined_intervals.jsonl")
     if str(metadata.get("video_id")) != video_id:
@@ -72,22 +72,41 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ArtifactValidationError("sampling.decoder 只能是 auto、opencv 或 ffmpeg")
 
 
-def validate_points(points: list[dict[str, Any]], intervals: list[dict[str, Any]], metadata: dict[str, Any], sample_fps: float) -> None:
+def validate_observations(observations: list[dict[str, Any]], intervals: list[dict[str, Any]], metadata: dict[str, Any], sample_fps: float) -> None:
     bounds = {str(row["interval_id"]): (int(row["start_frame"]), int(row["end_frame"])) for row in intervals}
     seen: set[tuple[str, int]] = set()
     actual_by_interval: dict[str, list[tuple[int, int]]] = {interval_id: [] for interval_id in bounds}
-    for row in points:
+    for row in observations:
         interval_id, frame = str(row["interval_id"]), int(row["frame"])
         if interval_id not in bounds or not bounds[interval_id][0] <= frame < bounds[interval_id][1]:
-            raise ArtifactValidationError(f"主体点帧越界: {interval_id}/{frame}")
+            raise ArtifactValidationError(f"主体观察帧越界: {interval_id}/{frame}")
         key = (interval_id, int(row["sample_index"]))
         if key in seen:
-            raise ArtifactValidationError(f"重复主体点样本: {key}")
+            raise ArtifactValidationError(f"重复主体观察样本: {key}")
         seen.add(key)
         actual_by_interval[interval_id].append((int(row["sample_index"]), frame))
-        point = row.get("subject_point")
-        if point is not None and (not isinstance(point, list) or len(point) != 2 or not all(0 <= float(value) <= 1 for value in point)):
-            raise ArtifactValidationError(f"非法归一化主体点: {key}")
+        if row.get("group_mode") not in {"single", "multiple"}:
+            raise ArtifactValidationError(f"非法 group_mode: {key}")
+        phrases = row.get("grounding_phrases")
+        targets = row.get("targets")
+        if not isinstance(phrases, list) or not all(isinstance(value, str) and value.strip() for value in phrases):
+            raise ArtifactValidationError(f"非法 grounding_phrases: {key}")
+        if not isinstance(targets, list):
+            raise ArtifactValidationError(f"targets 非数组: {key}")
+        target_ids: set[str] = set()
+        for target in targets:
+            if not isinstance(target, dict):
+                raise ArtifactValidationError(f"target 非对象: {key}")
+            target_id = str(target.get("target_id", ""))
+            if not target_id or target_id in target_ids:
+                raise ArtifactValidationError(f"target_id 为空或重复: {key}/{target_id}")
+            target_ids.add(target_id)
+            point = target.get("subject_point")
+            if point is not None and (
+                not isinstance(point, list) or len(point) != 2
+                or not all(0 <= float(value) <= 1 for value in point)
+            ):
+                raise ArtifactValidationError(f"非法归一化主体点: {key}/{target_id}")
     if int(metadata["frame_count"]) <= 0:
         raise ArtifactValidationError("frame_count 必须大于 0")
     fps = float(metadata["fps"])
@@ -95,12 +114,12 @@ def validate_points(points: list[dict[str, Any]], intervals: list[dict[str, Any]
         expected_frames = plan_sample_frames(start, end, fps, sample_fps)
         actual = sorted(actual_by_interval[interval_id])
         if actual != list(enumerate(expected_frames)):
-            raise ArtifactValidationError(f"{interval_id} 的主体点未完整覆盖计划采样帧")
+            raise ArtifactValidationError(f"{interval_id} 的主体观察未完整覆盖计划采样帧")
 
 
 def validate_artifacts(video_dir: str | Path) -> dict[str, int]:
     root = Path(video_dir)
-    required = ("enriched_intervals.jsonl", "subject_points.jsonl", "requests.jsonl", "raw_responses.jsonl", "diagnostics.jsonl")
+    required = ("enriched_intervals.jsonl", "subject_observations.jsonl", "requests.jsonl", "raw_responses.jsonl", "diagnostics.jsonl")
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         raise ArtifactValidationError(f"Stage 3.5 缺少产物: {', '.join(missing)}")

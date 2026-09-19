@@ -35,6 +35,16 @@ python -m pip install "scenedetect==0.7.1" "PyYAML==6.0.3"
 
 也可以使用 `environment.yml` 更新环境。Stage 1 依赖 FFmpeg/FFprobe 可执行文件在 PATH 中可用。
 
+Grounding DINO + SAM2 后端还需要 GPU 版 PyTorch、官方 SAM2 包和可选依赖：
+
+```powershell
+python -m pip install -e ".[grounded-sam2]"
+```
+
+SAM2 权重放在 `model_store/sam2/`；将 Hugging Face
+`IDEA-Research/grounding-dino-tiny` 的完整模型目录放在
+`model_store/grounding-dino-tiny/`。默认配置禁止运行时联网下载。
+
 ## 运行 Stage 1
 
 先处理一个视频：
@@ -190,12 +200,14 @@ _SUCCESS.json
 Stage 3 只负责时间边界和主体语义透传，`refined_intervals.jsonl` 不包含
 `subject_point`；即使读取旧版 Stage 2 产物中的同名字段也会主动丢弃。
 
-## Stage 3.5：逐采样帧主体中心定位
+## Stage 3.5：逐采样帧多主体观察
 
 Stage 3.5 读取 Stage 3 最终高光区间，并只从 Stage 1 读取源视频路径、FPS 和
 总帧数。它不会复用 Stage 1 的粗采样帧，而是在每个 `[start_frame,end_frame)`
 内默认按 2 FPS 即时解码原视频，将全部采样 JPEG 和明确的原始帧号/时间戳顺序
-一次性发送给 Qwen。模型返回各 `sample_index` 的归一化 `[x,y]` 主体中心。
+一次性发送给 Qwen。模型为每个 `sample_index` 返回 `group_mode`、适合开放词汇检测
+的英文 `grounding_phrases`，以及零到多个目标；每个目标包含 `target_id`、描述、
+英文检测短语、归一化 `[x,y]` 中心、置信度和可见性。
 
 ```powershell
 python scripts/run_stage3_5.py `
@@ -205,7 +217,7 @@ python scripts/run_stage3_5.py `
   --strict
 ```
 
-跳过全部解码和模型调用、但生成相同采样时间轴和空点契约：
+跳过全部解码和模型调用、但生成相同采样时间轴和空目标契约：
 
 ```powershell
 python scripts/run_stage3_5.py `
@@ -216,7 +228,7 @@ python scripts/run_stage3_5.py `
   --strict
 ```
 
-每个视频输出 `enriched_intervals.jsonl`、`subject_points.jsonl`、
+每个视频输出 `enriched_intervals.jsonl`、`subject_observations.jsonl`、
 `requests.jsonl`、`raw_responses.jsonl`、`diagnostics.jsonl` 和 `_SUCCESS.json`。
 请求日志只保存帧号时间线和 JPEG 总字节数，不保存 Base64 图像本体。
 
@@ -232,19 +244,23 @@ python scripts/run_stage3_5.py `
 
 ## Stage 4：主体构图与轨迹优化
 
-Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_points.jsonl` 作为
-高光区间、主体语义和逐采样帧主体点的唯一上游契约。它只从 Stage 1 读取源视频
+Stage 4 以 Stage 3.5 的 `enriched_intervals.jsonl` 和 `subject_observations.jsonl`
+作为高光区间、主体语义、Grounding 短语和逐采样帧多主体点的唯一上游契约；仍可
+读取旧版 `subject_points.jsonl` 并自动适配为单目标观察。它只从 Stage 1 读取源视频
 路径、原始帧率/尺寸、`targetRatioWH` 和镜头边界；不会直接读取 Stage 2 或 Stage 3。
 
-默认使用不需要额外模型权重的 OpenCV 后端：在每个有效 Stage 3.5 采样点处重新
-校正主体框，采样点之间通过稀疏光流逐帧传播；没有可用点时使用中心偏置视觉显著性。
+默认配置使用 Grounding DINO + SAM2：每个镜头起点和 Stage 3.5 锚点先执行开放词汇
+检测，多个 Qwen 点分别认领检测框；检测框与上一窗口对象框进行空间关联并复用稳定
+`obj_id`，每个对象分别注册给 SAM2。传播阶段只合并当前窗口活跃对象的 Mask，生成
+覆盖全部主体的逐帧并集框。Grounding 失败时使用每个 Qwen 点的合成框继续启动 SAM2，
+SAM2 窗口失败时才回退到多点包围框插值。
+
 每帧围绕主体生成多尺度、多偏移、运动方向留白的目标比例候选框，使用动态规划选择
 低代价轨迹，再对中心和尺度做限速平滑。镜头边界两侧分别优化，不跨硬切镜头平滑。
 所有框最后统一取整、再次限界，并输出比赛需要的 `[x, y, w]`。
 
-当前 SAM2 实验路径会先按 Stage 1 镜头边界拆分状态，再把镜头内每个有效 Qwen
-中心点作为相邻窗口的条件帧。锚点 Mask 与 Qwen 点不一致时追加正点提示纠偏；窗口
-缺帧或失败时只对该窗口使用 Qwen 线性插值，不再丢弃整个高光区间的 SAM2 结果。
+锚点并集 Mask 与 Qwen 多点或 Grounding 多框不一致时，会把各 Qwen 正点追加到最近
+对象进行纠偏；窗口缺帧或失败时只回退该窗口，不丢弃整个高光区间的 SAM2 结果。
 `crop_candidates.fixed_maximum: true` 时，输出始终采用目标比例下的最大合法裁剪框，
 只让跟踪结果决定框中心。纯 Qwen 插值轨迹默认跳过单向 EMA，避免平滑滞后使
 `center` 后端偏离 baseline；SAM2 和光流产生的逐帧轨迹仍会执行平滑。
@@ -267,11 +283,13 @@ python scripts/run_stage4.py `
 
 可选后端：
 
-- `--backend opencv`：默认可运行基线，不需要新权重。
+- `--backend opencv`：不需要新权重的光流基线。
 - `--backend center`：不解码视频，按同镜头 Qwen 点线性插值；仅在镜头无有效点时
   使用固定中心框，也作为其他后端的区间失败降级。
 - `--backend sam2 --sam2-checkpoint <权重路径> --sam2-config <模型配置>`：使用官方
-  SAM2 视频预测器传播主体 Mask；只有选择该后端时才加载 SAM2 和 PyTorch。
+  SAM2 视频预测器传播主体 Mask。默认同时启用 Grounding DINO；可用
+  `--grounding-model <本地模型目录>` 覆盖模型，或用 `--no-grounding` 仅运行多 Qwen
+  点 + SAM2。只有选择该后端时才加载 SAM2、Grounding DINO 和 PyTorch。
 
 每个视频持久化输出：
 
@@ -279,6 +297,7 @@ python scripts/run_stage4.py `
 crops.jsonl         # Stage 5 直接消费的逐帧 [x,y,w]
 tracks.jsonl        # 主体 xyxy、置信度和跟踪来源，便于调试
 diagnostics.jsonl   # 区间状态、镜头子段数和降级信息
+grounding_anchors.jsonl # 每个锚点的原始候选、评分、obj_id、选择与回退信息
 _SUCCESS.json
 ```
 
