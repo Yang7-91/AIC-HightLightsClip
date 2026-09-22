@@ -66,14 +66,16 @@ def run_mhs_vis0(
     eventness_by_video = load_mhs1_eventness(mhs1_dir)
     subsegments_by_candidate = load_mhs1_subsegments(mhs1_dir)
 
-    # 预计算每个候选的 motion 峰，用于示例选择（只读视频）。
+    # 预计算每个候选的 motion 峰，用于示例选择（只读视频）；无视频文件的候选被剔除。
     peaks_by_candidate: dict[str, list[float]] = {}
     shots_by_candidate: dict[str, list[float]] = {}
     motion_by_candidate: dict[str, list[dict[str, float]]] = {}
+    available_by_video: dict[str, list[dict[str, Any]]] = {}
     for video_id, rows in candidates_by_video.items():
         video_path = resolve_video_path(video_root, video_id, manifest)
         if video_path is None:
             continue
+        available_rows = []
         for candidate in rows:
             try:
                 computed = compute_motion_and_shots(
@@ -84,6 +86,10 @@ def run_mhs_vis0(
             motion_by_candidate[candidate["candidate_id"]] = computed["samples"]
             shots_by_candidate[candidate["candidate_id"]] = computed["shot_boundaries_sec"]
             peaks_by_candidate[candidate["candidate_id"]] = find_motion_peaks(computed["samples"])
+            available_rows.append(candidate)
+        if available_rows:
+            available_by_video[video_id] = available_rows
+    candidates_by_video = available_by_video
 
     selected = select_visual_examples(
         candidates_by_video,
@@ -200,7 +206,12 @@ def run_mhs_vis0(
             markdown_lines.append(f"- contact sheet：`{contact_sheet}`")
             markdown_lines.append("")
 
-    run_summary = summarize_run_rule_based(selected)
+    run_summary = summarize_run_rule_based(
+        [
+            {"num_motion_peaks": entry["num_motion_peaks"]}
+            for entry in entries
+        ]
+    )
     summary = {
         "schema_version": "stage2_5.mhs_vis0.summary.v1",
         "stage": "Stage 2.5 diagnostic visualization",
@@ -255,8 +266,8 @@ def run_mhs_vis0(
     summary["outputs"] = {
         "visual_summary_json": str(output_json),
         "selected_examples_jsonl": str(selected_path),
-        "visual_report_html": html_path,
-        "markdown_report": markdown_path,
+        "visual_report_html": str(html_path) if html_path else None,
+        "markdown_report": str(markdown_path) if markdown_path else None,
         "assets_dir": str(assets_dir),
     }
     output_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -75,9 +75,14 @@ def _normalize_candidate(raw: dict[str, Any], video_id: str) -> dict[str, Any] |
     }
 
 
-def load_stage2_candidates(stage2_dir: str | Path) -> tuple[list[dict[str, Any]], dict[str, float]]:
+def load_stage2_candidates(
+    stage2_dir: str | Path,
+    *,
+    allowed_splits: tuple[str, ...] = ("dev",),
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """读取 Stage 2 candidates；兼容 JSONL 与 frozen cache 两种目录。
 
+    默认只加载 ``allowed_splits``（dev）中的记录；Heldout 永远拒绝。
     返回 (candidates, durations_by_video)。
     """
     root = Path(stage2_dir).expanduser().resolve()
@@ -88,10 +93,13 @@ def load_stage2_candidates(stage2_dir: str | Path) -> tuple[list[dict[str, Any]]
         manifest = json.loads((root / "cache_manifest.json").read_text(encoding="utf-8"))
         for entry in manifest["records"]:
             record = json.loads((root / entry["path"]).read_text(encoding="utf-8"))
-            if record.get("split") in _FORBIDDEN_SPLITS:
+            split = record.get("split")
+            if split in _FORBIDDEN_SPLITS:
                 raise VisualReportIOError(
-                    f"refusing to load heldout-like split: {record.get('split')!r}"
+                    f"refusing to load heldout-like split: {split!r}"
                 )
+            if allowed_splits and split not in allowed_splits:
+                continue
             video_id = str(record["video_id"])
             durations[video_id] = float(record["duration_sec"])
             for item in record.get("merged_candidates", []):
