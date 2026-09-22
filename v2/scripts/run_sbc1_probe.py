@@ -1,4 +1,4 @@
-"""SBC-1 探针 CLI（diagnostic-only）。
+﻿"""SBC-1 探针 CLI（diagnostic-only）。
 
 build-samples / classify / evaluate / run-all 四个子命令，严格只做诊断：
 不生成 refined candidates、不写回 Stage 2/3 正式产物、不访问 Hard/Heldout。
@@ -362,11 +362,12 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_config = PROJECT_ROOT / "configs/stage3/sbc1_semantic_boundary_probe.yaml"
     parser = argparse.ArgumentParser(description="SBC-1 多提示词语义边界判别探针（diagnostic-only）")
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/stage3/sbc1_semantic_boundary_probe.yaml")
     commands = parser.add_subparsers(dest="command", required=True)
 
     build = commands.add_parser("build-samples", help="构建分层边界侧样本")
+    build.add_argument("--config", type=Path, default=default_config)
     build.add_argument("--oracle-labels", type=Path, required=True)
     build.add_argument("--cache-dir", type=Path, required=True)
     build.add_argument("--video-dir", type=Path, required=True)
@@ -374,6 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--output-dir", type=Path, required=True)
 
     classify = commands.add_parser("classify", help="对指定 prompt 变体调用 Qwen")
+    classify.add_argument("--config", type=Path, default=default_config)
     classify.add_argument("--samples", type=Path, required=True)
     classify.add_argument("--prompt-variant", required=True)
     classify.add_argument("--output", type=Path, required=True)
@@ -384,12 +386,14 @@ def build_parser() -> argparse.ArgumentParser:
     classify.add_argument("--resume", action="store_true")
 
     evaluate = commands.add_parser("evaluate", help="计算可分性指标")
+    evaluate.add_argument("--config", type=Path, default=default_config)
     evaluate.add_argument("--samples", type=Path, required=True)
     evaluate.add_argument("--predictions", type=Path, required=True)
     evaluate.add_argument("--prompt-variant", required=True)
     evaluate.add_argument("--output", type=Path, required=True)
 
     run_all = commands.add_parser("run-all", help="build-samples + 3 变体 classify + evaluate")
+    run_all.add_argument("--config", type=Path, default=default_config)
     run_all.add_argument("--oracle-labels", type=Path, required=True)
     run_all.add_argument("--cache-dir", type=Path, required=True)
     run_all.add_argument("--video-dir", type=Path, required=True)

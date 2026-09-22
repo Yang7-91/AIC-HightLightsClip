@@ -304,42 +304,53 @@ def extract_clip_data_url(
     ffmpeg_bin: str = "ffmpeg",
     fps: float = 2.0,
     max_payload_mib: float = 64.0,
+    work_dir: str | Path | None = None,
 ) -> str:
-    """用 ffmpeg 截取片段并编码为 data:video/mp4;base64 URL。"""
+    """用 ffmpeg 截取片段并编码为 data:video/mp4;base64 URL。
+
+    mp4 muxer 需要可 seek 的输出，因此先写入临时文件再读回编码。
+    """
+    import tempfile
+
     duration = end_sec - start_sec
     if duration <= 0:
         raise ValueError(f"invalid clip window: [{start_sec}, {end_sec}]")
-    command = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-ss",
-        f"{start_sec:.3f}",
-        "-i",
-        str(video_path),
-        "-t",
-        f"{duration:.3f}",
-        "-an",
-        "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-        "-r",
-        f"{fps}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-f",
-        "mp4",
-        "pipe:1",
-    ]
-    completed = subprocess.run(command, capture_output=True, check=False)
-    if completed.returncode != 0 or not completed.stdout:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip() or "unknown ffmpeg error"
-        raise RuntimeError(f"ffmpeg clip extraction failed: {detail}")
-    encoded = base64.b64encode(completed.stdout).decode("ascii")
+    with tempfile.TemporaryDirectory(dir=str(work_dir) if work_dir else None) as tmp:
+        clip_path = Path(tmp) / "clip.mp4"
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start_sec:.3f}",
+            "-i",
+            str(video_path),
+            "-t",
+            f"{duration:.3f}",
+            "-an",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-r",
+            f"{fps}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            str(clip_path),
+        ]
+        completed = subprocess.run(command, capture_output=True, check=False)
+        if completed.returncode != 0 or not clip_path.is_file() or clip_path.stat().st_size == 0:
+            detail = (
+                completed.stderr.decode("utf-8", errors="replace").strip()
+                or "unknown ffmpeg error"
+            )
+            raise RuntimeError(f"ffmpeg clip extraction failed: {detail}")
+        raw = clip_path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
     payload_mib = len(encoded) / (1024 * 1024)
     if payload_mib > max_payload_mib:
         raise RuntimeError(
