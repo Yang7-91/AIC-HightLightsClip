@@ -1,0 +1,105 @@
+schema_version: stage2_5.mhs1_formal_splitter.v1
+stage: Stage 2.5
+method: MHS-1
+name: Multi-Highlight Candidate Splitter
+diagnostic_only: false
+deployable_method: true
+
+input:
+  stage1_dir: null
+  stage2_dir: null
+  stage3_dir: null
+  candidates_file: candidates.jsonl
+  use_stage3_intervals_if_available: false
+
+candidate_filter:
+  min_candidate_duration_sec: 12.0
+  long_candidate_duration_sec: 18.0
+  min_peak_count_for_split: 2
+
+eventness:
+  bin_sec: 1.0
+  sample_fps: 2.0
+  smooth_window_sec: 3.0
+  signals:
+    frame_difference: true
+    shot_boundary: true
+    audio_energy: true
+    yolo_detection_density: false
+    yolo_track_motion: false
+  weights:
+    frame_difference: 0.45
+    shot_boundary: 0.20
+    audio_energy: 0.20
+    yolo_detection_density: 0.10
+    yolo_track_motion: 0.05
+
+splitter:
+  configs:
+    MHS-1-C1:
+      peak_min_distance_sec: 4.0
+      valley_quantile_max: 0.40
+      min_subsegment_duration_sec: 4.0
+      max_subsegments_per_candidate: 4
+      pad_sec: 1.0
+      merge_gap_sec: 2.0
+      max_coverage_reduction_ratio: 0.35
+      fallback_if_uncertain: true
+    MHS-1-C2:
+      peak_min_distance_sec: 3.0
+      valley_quantile_max: 0.45
+      min_subsegment_duration_sec: 3.0
+      max_subsegments_per_candidate: 5
+      pad_sec: 1.0
+      merge_gap_sec: 1.5
+      max_coverage_reduction_ratio: 0.45
+      fallback_if_uncertain: true
+    MHS-1-C3:
+      peak_min_distance_sec: 5.0
+      valley_quantile_max: 0.35
+      min_subsegment_duration_sec: 5.0
+      max_subsegments_per_candidate: 3
+      pad_sec: 1.5
+      merge_gap_sec: 2.0
+      max_coverage_reduction_ratio: 0.30
+      fallback_if_uncertain: true
+
+yolo:
+  enabled: false
+  optional: true
+  model: yolo11n.pt
+  tracker: bytetrack.yaml
+  fps: 4.0
+  conf: 0.25
+  iou: 0.5
+
+small_vlm_rerank:
+  enabled: false
+  optional: true
+  model_priority:
+    - Qwen/Qwen2.5-VL-3B-Instruct-AWQ
+    - OpenGVLab/InternVL3_5-2B
+    - HuggingFaceTB/SmolVLM2-2.2B-Instruct
+  use_only_if_available_locally: true
+  temperature: 0.0
+  max_tokens: 512
+  enable_thinking: false
+  min_highlight_score: 0.55
+
+safety:
+  never_drop_all_subsegments: true
+  recall_safety_fallback: true
+  keep_original_if_split_invalid: true
+  no_heldout: true
+  no_hard_tuning: true
+  no_training: true
+  no_stage4: true
+  no_stage5: true
+  does_not_modify_stage2_stage3_mainline: true
+
+promotion_gate:
+  recall_delta_min: -0.01
+  precision_delta_min: 0.005
+  f1_or_tiou_delta_min: 0.003
+  coverage_delta_max: -0.01
+  new_zero_recall_allowed: 0
