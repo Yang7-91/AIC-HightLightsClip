@@ -234,5 +234,20 @@ def render_timeline_svg(
         parts.append(
             f'<circle cx="{px:.1f}" cy="{curve_top + 4:.1f}" r="3" fill="#facc15"/>'
         )
+    # 时间刻度（5 段）
+    tick_y1 = track_top + track_height + 26.0
+    tick_y2 = tick_y1 + 5.0
+    for index in range(6):
+        t_sec = duration * index / 5.0
+        tx = x_of(t_sec)
+        parts.append(
+            f'<line x1="{tx:.1f}" y1="{tick_y1:.1f}" x2="{tx:.1f}" y2="{tick_y2:.1f}" '
+            f'stroke="#475569" stroke-width="1"/>'
+        )
+        anchor = "start" if index == 0 else ("end" if index == 5 else "middle")
+        parts.append(
+            f'<text x="{tx:.1f}" y="{tick_y2 + 12:.1f}" text-anchor="{anchor}" '
+            f'font-size="10" fill="#64748b">{t_sec:.1f}s</text>'
+        )
     parts.append("</svg>")
     return "".join(parts)

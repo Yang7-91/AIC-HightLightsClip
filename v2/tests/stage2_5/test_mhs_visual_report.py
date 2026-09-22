@@ -291,5 +291,153 @@ class HTMLTests(unittest.TestCase):
         self.assertNotIn("refined_intervals.jsonl\", \"w", source)
 
 
+class ExportMarkdownTests(unittest.TestCase):
+    def _make_vis_dir(self, tmp: str) -> Path:
+        vis = Path(tmp)
+        (vis / "assets").mkdir(parents=True, exist_ok=True)
+        video_id = "qvh_000005_9x16"
+        candidate_id = "merged-v1-6e30053afcb035de3ed0ac43f2d12b28e432b49607cdce6f060500c57dbb21ee"
+        prefix = f"{video_id}_{candidate_id[:12]}"
+        (vis / "assets" / f"{prefix}_contact_sheet.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        )
+        summary = {
+            "schema_version": "stage2_5.mhs_vis0.summary.v1",
+            "diagnostic_only": True,
+            "deployable_method": False,
+            "num_selected_examples": 1,
+            "num_videos": 1,
+            "run_summary": "本轮共选择 1 个候选用于可视化诊断。",
+            "entries": [
+                {
+                    "video_id": video_id,
+                    "candidate_id": candidate_id,
+                    "duration_sec": 19.085752,
+                    "num_motion_peaks": 5,
+                    "num_subsegments": 0,
+                    "candidate_summary": "候选大段：约 19.1 秒，内部存在 5 个运动峰。",
+                    "selection_reason": "long_candidate+multi_peak+high_coverage",
+                }
+            ],
+            "outputs": {"assets_dir": str(vis / "assets")},
+            "heldout_accessed": False,
+        }
+        (vis / "visual_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False), encoding="utf-8"
+        )
+        selected = {
+            "video_id": video_id,
+            "candidate_id": candidate_id,
+            "candidate_start_sec": 0.0,
+            "candidate_end_sec": 19.085752,
+            "duration_sec": 19.085752,
+            "reason": "long_candidate+multi_peak+high_coverage",
+            "num_motion_peaks": 5,
+            "num_proposed_subsegments": 0,
+        }
+        (vis / "selected_examples.jsonl").write_text(
+            json.dumps(selected, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        (vis / "visual_report.html").write_text(
+            '<html><body><svg xmlns="http://www.w3.org/2000/svg"><rect/></svg></body></html>',
+            encoding="utf-8",
+        )
+        (vis / "mhs_vis0_report.md").write_text(
+            f"## {video_id} · {candidate_id[:24]}…\n\n"
+            "- 运动峰：5 个 @ 0.5s, 5.5s, 9.5s, 14.5s, 18.0s\n"
+            "- 镜头切换（候选内）：1 个\n",
+            encoding="utf-8",
+        )
+        return vis
+
+    def test_export_md_generates_markdown(self) -> None:
+        import tempfile
+
+        from video_highlight.stage2_5_visual_report.markdown_report import (
+            write_markdown_case_report,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vis = self._make_vis_dir(tmp)
+            path = write_markdown_case_report(vis, vis / "mhs_vis0_visual_case_report.md")
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn("# MHS-VIS-1", text)
+            self.assertIn("Case 1", text)
+            self.assertIn("<svg", text)
+
+    def test_markdown_contains_relative_contact_sheet(self) -> None:
+        import tempfile
+
+        from video_highlight.stage2_5_visual_report.markdown_report import (
+            write_markdown_case_report,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vis = self._make_vis_dir(tmp)
+            path = write_markdown_case_report(vis, vis / "report.md")
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn("![contact sheet](assets/qvh_000005_9x16_merged-v1-6e_contact_sheet.png)", text)
+            self.assertNotIn("/root/autodl-tmp", text)
+
+    def test_markdown_contains_svg_or_fallback(self) -> None:
+        import tempfile
+
+        from video_highlight.stage2_5_visual_report.markdown_report import (
+            write_markdown_case_report,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vis = self._make_vis_dir(tmp)
+            path = write_markdown_case_report(vis, vis / "report.md")
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertTrue("<svg" in text or "peak@" in text)
+
+    def test_markdown_has_multiple_cases_and_summary(self) -> None:
+        import tempfile
+
+        from video_highlight.stage2_5_visual_report.markdown_report import (
+            write_markdown_case_report,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vis = self._make_vis_dir(tmp)
+            path = write_markdown_case_report(vis, vis / "report.md")
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn("## 3. 案例总览表", text)
+            self.assertIn("## 4. 典型案例", text)
+            self.assertIn("运动峰 / 事件峰", text)
+            self.assertIn("镜头切换", text)
+            self.assertIn("before-only", text)
+
+    def test_github_summary_has_no_png(self) -> None:
+        import tempfile
+
+        from video_highlight.stage2_5_visual_report.markdown_report import (
+            write_github_summary,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vis = self._make_vis_dir(tmp)
+            path = write_github_summary(vis, Path(tmp) / "summary.md")
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertNotIn(".png", text)
+            self.assertNotIn("![", text)
+            self.assertIn("未访问 Heldout", text)
+            self.assertIn("qvh_000005_9x16", text)
+
+    def test_cli_export_md_help_runs(self) -> None:
+        import subprocess
+
+        script = PROJECT_ROOT / "scripts/run_mhs_visual_report.py"
+        completed = subprocess.run(
+            [sys.executable, str(script), "export-md", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("--vis-dir", completed.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

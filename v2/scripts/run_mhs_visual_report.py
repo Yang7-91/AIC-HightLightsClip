@@ -18,6 +18,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from video_highlight.common.config import load_mapping  # noqa: E402
+from video_highlight.stage2_5_visual_report.markdown_report import (  # noqa: E402
+    make_bundle,
+    write_github_summary,
+    write_markdown_case_report,
+)
 from video_highlight.stage2_5_visual_report.pipeline import run_mhs_vis0  # noqa: E402
 
 VIS0_CONFIG_SCHEMA = "stage2_5.mhs_vis0_visual_report.v1"
@@ -86,6 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = commands.add_parser("smoke", parents=[common_parent], help="小样本 smoke（默认 3 个）")
     smoke.add_argument("--limit", type=int, default=3)
     smoke.add_argument("--output-dir", type=Path)
+
+    export_md = commands.add_parser(
+        "export-md", help="把 MHS-VIS-0 输出目录导出为 Markdown-first 图文案例报告"
+    )
+    export_md.add_argument("--vis-dir", type=Path, required=True, help="MHS-VIS-0 输出目录")
+    export_md.add_argument("--output", type=Path, help="full Markdown 输出路径（默认写入 vis-dir）")
+    export_md.add_argument("--video-root", type=Path, help="可选：用于补算运动峰/镜头明细")
+    export_md.add_argument("--video-manifest", type=Path)
+    export_md.add_argument("--github-summary", type=Path, help="可选：同时生成脱敏摘要路径")
+    export_md.add_argument("--bundle", action="store_true", help="可选：打包本地 zip（仅本地）")
     return parser
 
 
@@ -104,6 +119,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir = Path("runs") / f"stage2_5_mhs_vis0_smoke_{datetime.now():%Y%m%d_%H%M%S}"
         args.output_dir = output_dir
         return _run(args, limit=int(args.limit))
+    if args.command == "export-md":
+        vis_dir = args.vis_dir.expanduser().resolve()
+        output = args.output or (vis_dir / "mhs_vis0_visual_case_report.md")
+        full_path = write_markdown_case_report(
+            vis_dir,
+            output,
+            video_root=args.video_root,
+            video_manifest=args.video_manifest,
+        )
+        result: dict[str, object] = {"full_markdown": full_path}
+        if args.github_summary:
+            result["github_summary"] = write_github_summary(vis_dir, args.github_summary)
+        if args.bundle:
+            result["bundle_zip"] = make_bundle(vis_dir)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     parser.error(f"unknown command: {args.command}")
     return 2
 
