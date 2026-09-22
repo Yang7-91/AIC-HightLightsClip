@@ -1,0 +1,66 @@
+schema_version: stage2_5.mhs_vis0_visual_report.v1
+stage: Stage 2.5 diagnostic visualization
+method: MHS-VIS-0
+name: Multi-Highlight Visual Evidence Report
+diagnostic_only: true
+deployable_method: false
+
+input:
+  stage1_dir: null
+  stage2_dir: null
+  stage3_dir: null
+  mhs1_dir: null
+  video_root: null
+  candidates_file: candidates.jsonl
+  refined_intervals_file: refined_intervals.jsonl
+  eventness_file: mhs1_eventness_bins.jsonl
+  subsegments_file: mhs1_proposed_subsegments.jsonl
+
+selection:
+  mode: auto
+  max_videos: 6
+  max_candidates_per_video: 2
+  prefer_long_candidates: true
+  min_candidate_duration_sec: 18.0
+  prefer_multi_peak_candidates: true
+  prefer_high_coverage_candidates: true
+  seed: 20260922
+  allow_manual_video_ids: []
+
+visualization:
+  thumbnail_fps: 1.0
+  max_thumbnails_per_candidate: 40
+  contact_sheet_thumb_width: 180
+  timeline_width_px: 1400
+  show_original_candidate: true
+  show_proposed_subsegments: true
+  show_eventness_curve: true
+  show_yolo_density: true
+  show_motion: true
+  show_audio_energy: true
+  show_shot_boundaries: true
+  show_vlm_scores: true
+
+highlight_summary:
+  enabled: true
+  mode: rule_based
+  optional_vlm: false
+  max_summary_chars: 80
+  include_eventness_reason: true
+  include_visual_keywords: true
+
+output:
+  write_html: true
+  write_contact_sheet_png: true
+  write_json_summary: true
+  write_markdown_report: true
+  export_preview_mp4: false
+
+safety:
+  no_heldout: true
+  no_hard_tuning: true
+  no_training: true
+  no_stage4: true
+  no_stage5: true
+  does_not_modify_predictions: true
+  do_not_commit_generated_assets: true
